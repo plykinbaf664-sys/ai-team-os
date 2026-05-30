@@ -1,4 +1,4 @@
-import { getAgent, type AgentRole } from "./agent-registry";
+import { agentRegistry, getAgent, type AgentRole } from "./agent-registry";
 import { assertRootAgentCall } from "./loop-guard";
 import {
   buildProjectAssistantPrompt,
@@ -31,6 +31,13 @@ export async function routeAgentMessage(
   input: RouteAgentMessageInput,
 ): Promise<RouteAgentMessageResult> {
   assertRootAgentCall(input.role);
+
+  if (isStatusCommand(input.text)) {
+    return {
+      role: "project",
+      text: buildProjectStatusMessage(),
+    };
+  }
 
   const agent = getAgent(input.role);
 
@@ -113,4 +120,41 @@ function extractOpenAIText(data: OpenAIResponse) {
     .filter(Boolean)
     .join("\n")
     .trim();
+}
+
+function isStatusCommand(text: string) {
+  return /^(status|статус)$/i.test(text.trim());
+}
+
+function buildProjectStatusMessage() {
+  const enabledAgents = Object.values(agentRegistry)
+    .filter((agent) => agent.enabled)
+    .map((agent) => agent.displayName)
+    .join(", ");
+
+  const disabledAgents = Object.values(agentRegistry)
+    .filter((agent) => !agent.enabled)
+    .map((agent) => agent.displayName)
+    .join(", ");
+
+  return [
+    "AI Team OS status",
+    "",
+    `Webhook: online`,
+    `Project Assistant: active`,
+    `OpenAI API key: ${formatConfigured(process.env.OPENAI_API_KEY)}`,
+    `Telegram bot token: ${formatConfigured(process.env.TELEGRAM_BOT_TOKEN)}`,
+    `Webhook secret: ${formatConfigured(process.env.TELEGRAM_WEBHOOK_SECRET)}`,
+    `OpenAI model: ${process.env.OPENAI_MODEL || "gpt-4.1-mini"}`,
+    "",
+    `Enabled agents: ${enabledAgents || "none"}`,
+    `Disabled agents: ${disabledAgents || "none"}`,
+    "",
+    "Prefixes: project, проджект",
+    "Diagnostics: project status, проджект status",
+  ].join("\n");
+}
+
+function formatConfigured(value: string | undefined) {
+  return value ? "configured" : "missing";
 }

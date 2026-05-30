@@ -14,26 +14,46 @@ export async function POST(request: Request) {
     return Response.json({ ok: true, ignored: "non_text_message" });
   }
 
+  if (message.from?.is_bot) {
+    return Response.json({ ok: true, ignored: "bot_message" });
+  }
+
   const command = parseProjectCommand(message.text);
 
   if (!command) {
     return Response.json({ ok: true, ignored: "no_project_command" });
   }
 
-  const result = await routeAgentMessage({
-    role: "project",
-    text: command,
-    chatId: message.chat.id,
-    userName: message.from?.username ?? message.from?.first_name ?? "user",
-  });
+  try {
+    const result = await routeAgentMessage({
+      role: "project",
+      text: command,
+      chatId: message.chat.id,
+      userName: message.from?.username ?? message.from?.first_name ?? "user",
+    });
 
-  await sendTelegramMessage({
-    chatId: message.chat.id,
-    text: result.text,
-    replyToMessageId: message.message_id,
-  });
+    await sendTelegramMessage({
+      chatId: message.chat.id,
+      text: result.text,
+      replyToMessageId: message.message_id,
+    });
 
-  return Response.json({ ok: true, agent: result.role });
+    return Response.json({ ok: true, agent: result.role });
+  } catch (error) {
+    console.error("Telegram webhook failed", error);
+
+    try {
+      await sendTelegramMessage({
+        chatId: message.chat.id,
+        text: "Project Assistant получил задачу, но сейчас не смог подготовить ответ. Проверьте логи сервера и переменные окружения.",
+        replyToMessageId: message.message_id,
+      });
+    } catch (sendError) {
+      console.error("Telegram fallback message failed", sendError);
+    }
+
+    return Response.json({ ok: false, error: "agent_failed" }, { status: 200 });
+  }
 }
 
 export async function GET() {
@@ -55,7 +75,7 @@ function isValidTelegramSecret(request: Request) {
 
 function parseProjectCommand(text: string) {
   const normalized = text.trim();
-  const match = normalized.match(/^\/?project(?:@\w+)?(?:\s+([\s\S]+))?$/i);
+  const match = normalized.match(/^\/?(?:project|проджект)(?:@\w+)?(?:\s+([\s\S]+))?$/i);
 
   if (!match) {
     return null;
