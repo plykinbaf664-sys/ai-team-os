@@ -8,7 +8,7 @@ const agents = [
   {
     name: "Research Agent",
     command: "research",
-    status: "planned",
+    status: "active",
     scope: "Сбор фактов, ссылок и исходных материалов для запуска.",
   },
   {
@@ -27,9 +27,10 @@ const agents = [
 
 const checks = [
   ["Webhook", "/api/telegram/webhook"],
-  ["Telegram command", "project <задача>"],
+  ["Project command", "project <задача>"],
+  ["Research command", "research <тема>"],
   ["Runtime", "Next.js route handler"],
-  ["Loop guard", "root agent only"],
+  ["Loop guard", "manual agents only"],
 ];
 
 export default function Home() {

@@ -21,7 +21,7 @@ export function canCallAgent({ callerRole, targetRole, depth }: LoopGuardInput) 
 }
 
 export function assertRootAgentCall(role: AgentRole) {
-  if (role !== "project") {
-    throw new Error("Only the Project Assistant can be called directly in the MVP.");
+  if (role !== "project" && role !== "research") {
+    throw new Error("Only Project Assistant and Research Agent can be called directly in the MVP.");
   }
 }

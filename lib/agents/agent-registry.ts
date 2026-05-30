@@ -25,7 +25,7 @@ export const agentRegistry: Record<AgentRole, AgentDefinition> = {
   research: {
     role: "research",
     displayName: "Research Agent",
-    enabled: false,
+    enabled: true,
     canDelegate: false,
   },
   product: {
