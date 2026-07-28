@@ -1,5 +1,19 @@
-import { agentRegistry, getAgent, type AgentRole } from "./agent-registry";
-import { assertRootAgentCall, canCallAgent } from "./loop-guard";
+import { randomUUID } from "node:crypto";
+import {
+  agentRegistry,
+  getAgent,
+  type AgentRole,
+  type RootAgentRole,
+} from "./agent-registry";
+import { runAssistantPipeline } from "./assistant/assistant-core";
+import { runProjectPipeline } from "./project/project-core";
+import { canCallAgent } from "./loop-guard";
+import type {
+  AgentPersistenceEnvelope,
+  JsonObject,
+  JsonValue,
+  PersistenceAction,
+} from "../database/types";
 import {
   buildProjectAssistantPrompt,
   projectAssistantSystemPrompt,
@@ -24,6 +38,7 @@ type RouteAgentMessageResult = {
     content: string;
     caption?: string;
   };
+  persistence?: AgentPersistenceEnvelope;
 };
 
 type OpenAIResponse = {
@@ -45,11 +60,195 @@ type OpenAIResponse = {
   }>;
 };
 
+export function routeRootAgentMessage(input: {
+  role: RootAgentRole;
+  text: string;
+}): RouteAgentMessageResult {
+  if (input.role === "assistant") {
+    const pipeline = runAssistantPipeline(input.text);
+    const traceId = createRuntimeId("trace");
+    const rootRunId = createRuntimeId("run");
+
+    return {
+      role: "assistant",
+      text: pipeline.text,
+      persistence: {
+        traceId,
+        rootRunId,
+        runs: [
+          {
+            id: rootRunId,
+            traceId,
+            role: "assistant",
+            status:
+              pipeline.outcome.kind === "clarification"
+                ? "needs_clarification"
+                : pipeline.outcome.kind === "confirmation"
+                  ? "needs_confirmation"
+                  : "completed",
+            depth: 0,
+            payload: { source_text: input.text },
+            output: {
+              outcome: pipeline.outcome.kind,
+              response_text: pipeline.text,
+            },
+          },
+        ],
+        actions:
+          pipeline.outcome.kind === "ready"
+            ? pipeline.outcome.plan.actions.map((action) => {
+                const result = pipeline.results.find(
+                  (candidate) => candidate.actionId === action.id,
+                );
+
+                return {
+                  externalActionId: action.id,
+                  actionType: action.type,
+                  payload: toJsonObject(action.payload),
+                  status: mapActionRequestStatus(result?.status),
+                  result,
+                } satisfies PersistenceAction;
+              })
+            : [],
+        confirmations:
+          pipeline.outcome.kind === "confirmation"
+            ? [
+                {
+                  prompt: pipeline.outcome.prompt,
+                  reason: pipeline.outcome.reason,
+                  operationSummary: pipeline.outcome.operationSummary,
+                },
+              ]
+            : [],
+        artifacts: [],
+      },
+    };
+  }
+
+  const pipeline = runProjectPipeline(input.text);
+
+  return {
+    role: "project",
+    text: pipeline.text,
+    persistence: {
+      traceId: pipeline.state.traceId,
+      rootRunId: pipeline.state.rootRunId,
+      runs: [
+        {
+          id: pipeline.state.rootRunId,
+          traceId: pipeline.state.traceId,
+          role: "project",
+          status: pipeline.report.status,
+          depth: 0,
+          payload: { goal: pipeline.state.plan.goal },
+          output: {
+            plan_id: pipeline.state.plan.id,
+            summary: pipeline.report.summary,
+          },
+        },
+        ...pipeline.state.agentRuns.map((run) => ({
+          id: run.request.runId,
+          traceId: run.request.traceId,
+          parentRunId: run.request.parentRunId,
+          role: run.request.targetAgent,
+          status: run.status,
+          depth: run.request.depth,
+          payload: {
+            task: run.request.payload.task,
+            project_goal: run.request.payload.projectGoal,
+          },
+          output: run.artifactId
+            ? { artifact_id: run.artifactId }
+            : undefined,
+        })),
+      ],
+      actions: [],
+      confirmations: [],
+      artifacts: pipeline.state.artifacts.map((artifact) => ({
+        id: artifact.id,
+        traceId: artifact.traceId,
+        runId: artifact.runId,
+        type: artifact.type,
+        title: artifact.title,
+        content: { text: artifact.content },
+        createdAt: artifact.createdAt,
+      })),
+    },
+  };
+}
+
+function mapActionRequestStatus(
+  resultStatus:
+    | "succeeded"
+    | "failed"
+    | "needs_clarification"
+    | "needs_confirmation"
+    | undefined,
+): PersistenceAction["status"] {
+  if (resultStatus === "succeeded") {
+    return "completed";
+  }
+
+  return resultStatus ?? "ready";
+}
+
+function toJsonObject(value: unknown): JsonObject {
+  const converted = toJsonValue(value);
+
+  if (
+    typeof converted !== "object" ||
+    converted === null ||
+    Array.isArray(converted)
+  ) {
+    throw new Error("Expected a JSON object.");
+  }
+
+  return converted;
+}
+
+function toJsonValue(value: unknown): JsonValue {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("Non-finite numbers cannot be persisted as JSON.");
+    }
+
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(toJsonValue);
+  }
+
+  if (typeof value === "object") {
+    const result: JsonObject = {};
+
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry !== undefined) {
+        result[key] = toJsonValue(entry);
+      }
+    }
+
+    return result;
+  }
+
+  throw new Error("Unsupported JSON value.");
+}
+
+function createRuntimeId(prefix: string) {
+  return `${prefix}_${randomUUID()}`;
+}
+
 export async function routeAgentMessage(
   input: RouteAgentMessageInput,
 ): Promise<RouteAgentMessageResult> {
-  assertRootAgentCall(input.role);
-
   if (isStatusCommand(input.text)) {
     return {
       role: "project",

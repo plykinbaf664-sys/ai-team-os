@@ -1,4 +1,9 @@
-import type { AgentRole } from "./agent-registry";
+import {
+  isRootAgentRole,
+  isSpecialistAgentRole,
+  type AgentRole,
+  type RootAgentRole,
+} from "./agent-registry";
 
 type LoopGuardInput = {
   callerRole: AgentRole;
@@ -17,11 +22,13 @@ export function canCallAgent({ callerRole, targetRole, depth }: LoopGuardInput) 
     return false;
   }
 
-  return targetRole !== callerRole;
+  return isSpecialistAgentRole(targetRole);
 }
 
-export function assertRootAgentCall(role: AgentRole) {
-  if (role !== "project" && role !== "research") {
-    throw new Error("Only Project Assistant and Research Agent can be called directly in the MVP.");
+export function assertRootAgentCall(
+  role: AgentRole,
+): asserts role is RootAgentRole {
+  if (!isRootAgentRole(role)) {
+    throw new Error("Only Assistant Agent and Project Agent can be called directly.");
   }
 }
