@@ -115,7 +115,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = routeRootAgentMessage(agentRequest);
+    const result = await routeRootAgentMessage(agentRequest);
 
     if (!result.persistence) {
       throw new Error("Root agent result is missing persistence data.");
@@ -276,7 +276,7 @@ async function handleAssistantVoice({
       return Response.json({ ok: true, ignored: "no_agent_command" });
     }
 
-    const result = routeRootAgentMessage({
+    const result = await routeRootAgentMessage({
       role: "assistant",
       text: assistantText,
     });

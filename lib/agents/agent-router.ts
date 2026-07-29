@@ -60,12 +60,12 @@ type OpenAIResponse = {
   }>;
 };
 
-export function routeRootAgentMessage(input: {
+export async function routeRootAgentMessage(input: {
   role: RootAgentRole;
   text: string;
-}): RouteAgentMessageResult {
+}): Promise<RouteAgentMessageResult> {
   if (input.role === "assistant") {
-    const pipeline = runAssistantPipeline(input.text);
+    const pipeline = await runAssistantPipeline(input.text);
     const traceId = createRuntimeId("trace");
     const rootRunId = createRuntimeId("run");
 

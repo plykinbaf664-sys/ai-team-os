@@ -10,6 +10,7 @@ import type {
   SheetCellValue,
   TaskPriority,
 } from "./types";
+import { executeGoogleSheetsAction } from "@/lib/executors/google-sheets-executor";
 
 const ASSISTANT_MODES: AssistantMode[] = [
   "quick_command",
@@ -46,7 +47,9 @@ export type AssistantPipelineResult = {
   text: string;
 };
 
-export function runAssistantPipeline(sourceText: string): AssistantPipelineResult {
+export async function runAssistantPipeline(
+  sourceText: string,
+): Promise<AssistantPipelineResult> {
   const outcome = createMockActionPlan(sourceText);
 
   if (outcome.kind === "clarification") {
@@ -80,12 +83,12 @@ export function runAssistantPipeline(sourceText: string): AssistantPipelineResul
     };
   }
 
-  const results = executeMockActionPlan(validation.plan);
+  const results = await executeActionPlan(validation.plan);
 
   return {
     outcome,
     results,
-    text: formatMockResults(validation.plan, results),
+    text: formatResults(validation.plan, results),
   };
 }
 
@@ -102,6 +105,27 @@ export function createMockActionPlan(sourceText: string): AssistantPlanOutcome {
       operationSummary: text,
       reason: "Запрос похож на массовое, структурное или необратимое изменение.",
       prompt: "Подтверди операцию явно перед выполнением.",
+    };
+  }
+
+  if (isOwnProjectTrackerRequest(text)) {
+    return {
+      kind: "ready",
+      plan: {
+        version: 1,
+        mode: "create_structure",
+        sourceText: text,
+        actions: [
+          {
+            id: "action-1",
+            type: "create_sheet",
+            payload: {
+              title: "Операционный трекер собственного проекта",
+              blueprintId: "own-project-operations-v1",
+            },
+          },
+        ],
+      },
     };
   }
 
@@ -168,6 +192,32 @@ export function executeMockActionPlan(plan: ActionPlan): ActionResult[] {
         ? `Mock-задача подготовлена: ${action.payload.title}`
         : `Mock-действие ${action.type} подготовлено.`,
   }));
+}
+
+export async function executeActionPlan(plan: ActionPlan) {
+  const results: ActionResult[] = [];
+
+  for (const action of plan.actions) {
+    const googleSheetsResult = await executeGoogleSheetsAction(action);
+
+    results.push(
+      googleSheetsResult ?? executeMockActionPlan({
+        ...plan,
+        actions: [action],
+      })[0],
+    );
+  }
+
+  return results;
+}
+
+function isOwnProjectTrackerRequest(text: string) {
+  return (
+    /(?:создай|создать|сделай|сделать)/iu.test(text) &&
+    /(?:операционн\w*\s+трекер|трекер\w*\s+(?:собственного\s+)?проекта|таблиц\w*\s+(?:для\s+)?(?:собственного\s+)?проекта)/iu.test(
+      text,
+    )
+  );
 }
 
 function parseCreateTask(text: string): CreateTaskAction | null {
@@ -436,19 +486,32 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function formatMockResults(plan: ActionPlan, results: ActionResult[]) {
+function formatResults(plan: ActionPlan, results: ActionResult[]) {
   const task = plan.actions[0];
+  const containsOnlyGoogleSheetsActions = plan.actions.every(
+    (action) =>
+      action.type === "create_sheet" ||
+      action.type === "create_sheet_tab" ||
+      action.type === "update_sheet" ||
+      action.type === "create_sheet_blueprint",
+  );
   const dueDateText =
     task.type === "create_task" && task.payload.dueDateText
       ? `\nСрок из сообщения: ${task.payload.dueDateText}`
       : "";
 
-  return [
-    "Assistant Agent (mock)",
+  const lines = [
+    containsOnlyGoogleSheetsActions
+      ? "Assistant Agent"
+      : "Assistant Agent (mock)",
     "",
     results.map((result) => result.message).join("\n"),
     dueDateText,
-    "",
-    "Реальное внешнее действие не выполнялось.",
-  ].join("\n");
+  ];
+
+  if (!containsOnlyGoogleSheetsActions) {
+    lines.push("", "Реальное внешнее действие не выполнялось.");
+  }
+
+  return lines.join("\n");
 }
