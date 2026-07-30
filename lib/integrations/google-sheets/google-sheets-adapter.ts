@@ -2,8 +2,11 @@ import { createHash } from "node:crypto";
 import { createGoogleAccessTokenProvider } from "./google-auth";
 import type {
   CreatedSpreadsheet,
+  ExistingSpreadsheetMetadata,
+  ExistingSpreadsheetSummary,
   GoogleSheetBlueprint,
   GoogleSheetsAdapter,
+  SheetBorderBlueprint,
   SheetCellInput,
   SheetChartBlueprint,
   SheetConditionalFormat,
@@ -17,11 +20,19 @@ type SpreadsheetMetadata = {
   spreadsheetUrl?: string;
   properties?: {
     title?: string;
+    locale?: string;
+    timeZone?: string;
   };
   sheets?: Array<{
     properties?: {
       sheetId?: number;
       title?: string;
+      gridProperties?: {
+        rowCount?: number;
+        columnCount?: number;
+        frozenRowCount?: number;
+        frozenColumnCount?: number;
+      };
     };
   }>;
   developerMetadata?: Array<{
@@ -34,11 +45,13 @@ type DriveFile = {
   id?: string;
   name?: string;
   webViewLink?: string;
+  modifiedTime?: string;
   appProperties?: Record<string, string>;
 };
 
 type DriveListResponse = {
   files?: DriveFile[];
+  nextPageToken?: string;
 };
 
 type BatchUpdateResponse = {
@@ -51,11 +64,17 @@ type BatchUpdateResponse = {
   }>;
 };
 
+type ValueRangeResponse = {
+  range?: string;
+  values?: unknown[][];
+};
+
 const SHEETS_API = "https://sheets.googleapis.com/v4";
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const SPREADSHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet";
 const BLUEPRINT_METADATA_KEY = "ai_team_os_blueprint";
 const ACTION_METADATA_KEY = "ai_team_os_action";
+const MAX_READ_CELLS = 500;
 
 export function createGoogleSheetsAdapter({
   getAccessToken,
@@ -95,8 +114,8 @@ export function createGoogleSheetsAdapter({
     const fields = [
       "spreadsheetId",
       "spreadsheetUrl",
-      "properties(title)",
-      "sheets(properties(sheetId,title))",
+      "properties(title,locale,timeZone)",
+      "sheets(properties(sheetId,title,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount)))",
       "developerMetadata(metadataKey,metadataValue)",
     ].join(",");
 
@@ -219,6 +238,81 @@ export function createGoogleSheetsAdapter({
       await updateDriveState(spreadsheetId, idempotencyHash, "complete");
 
       return toCreatedSpreadsheet(spreadsheet, blueprint.title, false);
+    },
+
+    async findSpreadsheetsByTitle(title) {
+      const normalizedTitle = title.trim();
+
+      if (!normalizedTitle) {
+        throw new Error("Google Sheet title is required.");
+      }
+
+      const query = [
+        `mimeType='${SPREADSHEET_MIME_TYPE}'`,
+        "trashed=false",
+      ].join(" and ");
+      const files: DriveFile[] = [];
+      let pageToken: string | undefined;
+
+      do {
+        const parameters = new URLSearchParams({
+          q: query,
+          corpora: "user",
+          spaces: "drive",
+          pageSize: "1000",
+          orderBy: "modifiedTime desc",
+          fields: "nextPageToken,files(id,name,webViewLink,modifiedTime)",
+        });
+
+        if (pageToken) {
+          parameters.set("pageToken", pageToken);
+        }
+
+        const result = await requestJson<DriveListResponse>(
+          `${DRIVE_API}/files?${parameters.toString()}`,
+        );
+
+        files.push(...(result.files ?? []));
+        pageToken = result.nextPageToken;
+      } while (pageToken);
+
+      return files
+        .filter(
+          (file) =>
+            typeof file.id === "string" &&
+            typeof file.name === "string" &&
+            file.name.localeCompare(normalizedTitle, undefined, {
+              sensitivity: "base",
+            }) === 0,
+        )
+        .map(toExistingSpreadsheetSummary);
+    },
+
+    async getSpreadsheetMetadata(spreadsheetId) {
+      return toExistingSpreadsheetMetadata(
+        await getSpreadsheet(spreadsheetId),
+      );
+    },
+
+    async readRange({ spreadsheetId, range }) {
+      const spreadsheet = await getSpreadsheet(spreadsheetId);
+      resolveSheetId(spreadsheet, range);
+      assertBoundedRange(range, MAX_READ_CELLS);
+
+      const parameters = new URLSearchParams({
+        majorDimension: "ROWS",
+        valueRenderOption: "FORMATTED_VALUE",
+        dateTimeRenderOption: "FORMATTED_STRING",
+      });
+      const result = await requestJson<ValueRangeResponse>(
+        `${SHEETS_API}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}?${parameters.toString()}`,
+      );
+
+      return {
+        spreadsheetId,
+        range: result.range || range,
+        values: normalizeSheetValues(result.values),
+      };
     },
 
     async createSheetTab({ spreadsheetId, title }) {
@@ -351,7 +445,41 @@ export function buildBlueprintRequests(blueprint: GoogleSheetBlueprint) {
           rows: block.rows.map((row) => ({
             values: padRow(row, width).map(toCellData),
           })),
-          fields: "userEnteredValue",
+          fields: "userEnteredValue,chipRuns",
+        },
+      });
+    }
+
+    for (const merge of tab.merges) {
+      requests.push({
+        mergeCells: {
+          range: merge.range,
+          mergeType: merge.type,
+        },
+      });
+    }
+
+    for (const bandedRange of tab.bandedRanges) {
+      requests.push({
+        addBanding: {
+          bandedRange: {
+            range: bandedRange.range,
+            rowProperties: {
+              ...(bandedRange.headerColor
+                ? {
+                    headerColorStyle: {
+                      rgbColor: bandedRange.headerColor,
+                    },
+                  }
+                : {}),
+              firstBandColorStyle: {
+                rgbColor: bandedRange.firstBandColor,
+              },
+              secondBandColorStyle: {
+                rgbColor: bandedRange.secondBandColor,
+              },
+            },
+          },
         },
       });
     }
@@ -382,18 +510,105 @@ export function buildBlueprintRequests(blueprint: GoogleSheetBlueprint) {
       });
     }
 
-    if (tab.frozenRowCount || tab.frozenColumnCount) {
+    for (const style of tab.styles) {
+      const userEnteredFormat: Record<string, unknown> = {};
+      const fields: string[] = [];
+
+      if (style.backgroundColor) {
+        userEnteredFormat.backgroundColorStyle = {
+          rgbColor: style.backgroundColor,
+        };
+        fields.push("backgroundColorStyle");
+      }
+
+      if (
+        style.foregroundColor ||
+        style.bold !== undefined ||
+        style.fontSize !== undefined
+      ) {
+        userEnteredFormat.textFormat = {
+          ...(style.foregroundColor
+            ? {
+                foregroundColorStyle: {
+                  rgbColor: style.foregroundColor,
+                },
+              }
+            : {}),
+          ...(style.bold !== undefined ? { bold: style.bold } : {}),
+          ...(style.fontSize !== undefined
+            ? { fontSize: style.fontSize }
+            : {}),
+        };
+        fields.push("textFormat");
+      }
+
+      for (const property of [
+        "horizontalAlignment",
+        "verticalAlignment",
+        "wrapStrategy",
+      ] as const) {
+        if (style[property] !== undefined) {
+          userEnteredFormat[property] = style[property];
+          fields.push(property);
+        }
+      }
+
+      if (fields.length) {
+        requests.push({
+          repeatCell: {
+            range: style.range,
+            cell: { userEnteredFormat },
+            fields: `userEnteredFormat(${fields.join(",")})`,
+          },
+        });
+      }
+    }
+
+    if (
+      tab.frozenRowCount ||
+      tab.frozenColumnCount ||
+      tab.tabColor ||
+      tab.hideGridlines !== undefined
+    ) {
+      const sheetFields: string[] = [];
+      const properties: Record<string, unknown> = {
+        sheetId: tab.sheetId,
+      };
+
+      if (tab.frozenRowCount || tab.frozenColumnCount) {
+        properties.gridProperties = {
+          frozenRowCount: tab.frozenRowCount ?? 0,
+          frozenColumnCount: tab.frozenColumnCount ?? 0,
+          ...(tab.hideGridlines !== undefined
+            ? { hideGridlines: tab.hideGridlines }
+            : {}),
+        };
+        sheetFields.push(
+          "gridProperties.frozenRowCount",
+          "gridProperties.frozenColumnCount",
+        );
+
+        if (tab.hideGridlines !== undefined) {
+          sheetFields.push("gridProperties.hideGridlines");
+        }
+      } else if (tab.hideGridlines !== undefined) {
+        properties.gridProperties = {
+          hideGridlines: tab.hideGridlines,
+        };
+        sheetFields.push("gridProperties.hideGridlines");
+      }
+
+      if (tab.tabColor) {
+        properties.tabColorStyle = {
+          rgbColor: tab.tabColor,
+        };
+        sheetFields.push("tabColorStyle");
+      }
+
       requests.push({
         updateSheetProperties: {
-          properties: {
-            sheetId: tab.sheetId,
-            gridProperties: {
-              frozenRowCount: tab.frozenRowCount ?? 0,
-              frozenColumnCount: tab.frozenColumnCount ?? 0,
-            },
-          },
-          fields:
-            "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+          properties,
+          fields: sheetFields.join(","),
         },
       });
     }
@@ -449,6 +664,10 @@ export function buildBlueprintRequests(blueprint: GoogleSheetBlueprint) {
       );
     }
 
+    for (const border of tab.borders) {
+      requests.push(createBorderRequest(border));
+    }
+
     for (const width of tab.columnWidths) {
       requests.push({
         updateDimensionProperties: {
@@ -466,6 +685,23 @@ export function buildBlueprintRequests(blueprint: GoogleSheetBlueprint) {
       });
     }
 
+    for (const height of tab.rowHeights) {
+      requests.push({
+        updateDimensionProperties: {
+          range: {
+            sheetId: tab.sheetId,
+            dimension: "ROWS",
+            startIndex: height.startIndex,
+            endIndex: height.endIndex,
+          },
+          properties: {
+            pixelSize: height.pixelSize,
+          },
+          fields: "pixelSize",
+        },
+      });
+    }
+
     for (const chart of tab.charts) {
       requests.push(createChartRequest(tab.sheetId, chart));
     }
@@ -476,6 +712,31 @@ export function buildBlueprintRequests(blueprint: GoogleSheetBlueprint) {
   );
 
   return requests;
+}
+
+function createBorderRequest(border: SheetBorderBlueprint) {
+  const edge = {
+    style: border.style,
+    colorStyle: {
+      rgbColor: border.color,
+    },
+  };
+
+  return {
+    updateBorders: {
+      range: border.range,
+      ...(border.outer
+        ? {
+            top: edge,
+            bottom: edge,
+            left: edge,
+            right: edge,
+          }
+        : {}),
+      ...(border.innerHorizontal ? { innerHorizontal: edge } : {}),
+      ...(border.innerVertical ? { innerVertical: edge } : {}),
+    },
+  };
 }
 
 function createConditionalFormatRequest(
@@ -615,6 +876,34 @@ function toCellData(value: SheetCellInput) {
     };
   }
 
+  if (typeof value === "object" && value !== null && "chip" in value) {
+    const chip =
+      value.chip.type === "person"
+        ? {
+            personProperties: {
+              email: value.chip.email,
+              displayFormat: value.chip.displayFormat ?? "DEFAULT",
+            },
+          }
+        : {
+            richLinkProperties: {
+              uri: value.chip.uri,
+            },
+          };
+
+    return {
+      userEnteredValue: {
+        stringValue: "@",
+      },
+      chipRuns: [
+        {
+          startIndex: 0,
+          chip,
+        },
+      ],
+    };
+  }
+
   return toScalarCellData(value);
 }
 
@@ -683,6 +972,122 @@ function toCreatedSpreadsheet(
     title: spreadsheet.properties?.title || fallbackTitle,
     reused,
   };
+}
+
+function toExistingSpreadsheetSummary(
+  file: DriveFile,
+): ExistingSpreadsheetSummary {
+  const spreadsheetId = requireString(file.id, "file.id");
+
+  return {
+    spreadsheetId,
+    spreadsheetUrl:
+      file.webViewLink ||
+      `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+    title: requireString(file.name, "file.name"),
+    modifiedTime: file.modifiedTime,
+  };
+}
+
+function toExistingSpreadsheetMetadata(
+  spreadsheet: SpreadsheetMetadata,
+): ExistingSpreadsheetMetadata {
+  const spreadsheetId = requireString(
+    spreadsheet.spreadsheetId,
+    "spreadsheetId",
+  );
+
+  return {
+    spreadsheetId,
+    spreadsheetUrl:
+      spreadsheet.spreadsheetUrl ||
+      `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+    title: requireString(spreadsheet.properties?.title, "properties.title"),
+    locale: spreadsheet.properties?.locale,
+    timeZone: spreadsheet.properties?.timeZone,
+    tabs: (spreadsheet.sheets ?? []).map((sheet) => {
+      const properties = sheet.properties;
+
+      if (typeof properties?.sheetId !== "number") {
+        throw new Error("Google API response is missing sheetId.");
+      }
+
+      return {
+        sheetId: properties.sheetId,
+        title: requireString(properties.title, "sheet.properties.title"),
+        rowCount: properties.gridProperties?.rowCount ?? 0,
+        columnCount: properties.gridProperties?.columnCount ?? 0,
+        frozenRowCount: properties.gridProperties?.frozenRowCount ?? 0,
+        frozenColumnCount: properties.gridProperties?.frozenColumnCount ?? 0,
+      };
+    }),
+  };
+}
+
+function normalizeSheetValues(values: unknown[][] | undefined): SheetScalar[][] {
+  return (values ?? []).map((row) =>
+    row.map((value) => {
+      if (
+        value === null ||
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        return value;
+      }
+
+      return String(value);
+    }),
+  );
+}
+
+function assertBoundedRange(range: string, maxCells: number) {
+  const separatorIndex = range.indexOf("!");
+
+  if (separatorIndex < 1) {
+    throw new Error("Sheet range must include an explicit tab name.");
+  }
+
+  const cellRange = range.slice(separatorIndex + 1);
+  const match = cellRange.match(
+    /^\$?([A-Z]{1,3})\$?(\d+)(?::\$?([A-Z]{1,3})\$?(\d+))?$/i,
+  );
+
+  if (!match) {
+    throw new Error(
+      "Sheet read range must be bounded, for example 'Лист 1'!A1:D20.",
+    );
+  }
+
+  const startColumn = columnToIndex(match[1]);
+  const startRow = Number(match[2]);
+  const endColumn = columnToIndex(match[3] || match[1]);
+  const endRow = Number(match[4] || match[2]);
+
+  if (
+    startColumn > endColumn ||
+    startRow > endRow ||
+    startRow < 1 ||
+    endRow < 1
+  ) {
+    throw new Error("Sheet read range is invalid.");
+  }
+
+  const cellCount =
+    (endColumn - startColumn + 1) * (endRow - startRow + 1);
+
+  if (cellCount > maxCells) {
+    throw new Error(
+      `Sheet read range is too large: ${cellCount} cells; maximum is ${maxCells}.`,
+    );
+  }
+}
+
+function columnToIndex(column: string) {
+  return [...column.toUpperCase()].reduce(
+    (result, character) => result * 26 + character.charCodeAt(0) - 64,
+    0,
+  );
 }
 
 function blueprintMarker(blueprint: GoogleSheetBlueprint) {

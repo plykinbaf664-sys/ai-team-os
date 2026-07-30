@@ -5,6 +5,12 @@ export type AssistantMode =
   | "analytics"
   | "daily_summary";
 
+export type AssistantConversationMessage = {
+  role: "user" | "assistant";
+  text: string;
+  createdAt?: string;
+};
+
 export type TaskPriority = "low" | "normal" | "high" | "urgent";
 export type SheetCellValue = string | number | boolean | null;
 
@@ -76,6 +82,14 @@ export type CompleteTaskAction = Action<
   }
 >;
 
+export type ListTasksAction = Action<
+  "list_tasks",
+  {
+    project?: string;
+    limit?: number;
+  }
+>;
+
 export type CreateCalendarEventAction = Action<
   "create_calendar_event",
   {
@@ -118,10 +132,35 @@ export type CreateSheetTabAction = Action<
   }
 >;
 
+export type ExistingSheetTarget =
+  | {
+      kind: "id";
+      spreadsheetId: string;
+    }
+  | {
+      kind: "title";
+      title: string;
+    };
+
+export type FindSheetAction = Action<
+  "find_sheet",
+  {
+    title: string;
+  }
+>;
+
+export type ReadSheetAction = Action<
+  "read_sheet",
+  {
+    target: ExistingSheetTarget;
+    range?: string;
+  }
+>;
+
 export type UpdateSheetAction = Action<
   "update_sheet",
   {
-    spreadsheetId: string;
+    target: ExistingSheetTarget;
     range: string;
     operation: "append_rows" | "update_cells" | "clear_range";
     values?: SheetCellValue[][];
@@ -165,10 +204,13 @@ export type AssistantAction =
   | CreateTaskAction
   | UpdateTaskAction
   | CompleteTaskAction
+  | ListTasksAction
   | CreateCalendarEventAction
   | UpdateCalendarEventAction
   | CreateSheetAction
   | CreateSheetTabAction
+  | FindSheetAction
+  | ReadSheetAction
   | UpdateSheetAction
   | CreateSheetBlueprintAction
   | AnalyzeMetricsAction
@@ -206,10 +248,16 @@ export type ConfirmationRequest = {
   operationSummary: string;
 };
 
+export type AssistantDirectResponse = {
+  kind: "response";
+  text: string;
+};
+
 export type AssistantPlanOutcome =
   | {
       kind: "ready";
       plan: ActionPlan;
     }
   | ClarificationRequest
-  | ConfirmationRequest;
+  | ConfirmationRequest
+  | AssistantDirectResponse;

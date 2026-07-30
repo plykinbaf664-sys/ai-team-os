@@ -11,6 +11,17 @@ import type {
 
 export type TelegramUpdateClaim = "claimed" | "duplicate";
 
+export type RecentAssistantMessage = {
+  role: "user" | "assistant";
+  text: string;
+  createdAt?: string;
+};
+
+export type TelegramReplyContext = {
+  role: "assistant" | "project";
+  text: string;
+};
+
 export type Persistence = {
   claimTelegramUpdate(
     context: TelegramPersistenceContext,
@@ -28,6 +39,18 @@ export type Persistence = {
   completeTelegramUpdate(updateId: number, traceId: string): Promise<void>;
   failTelegramUpdate(updateId: number, error: unknown): Promise<void>;
   saveVoiceTranscript(input: VoiceTranscriptPersistenceInput): Promise<void>;
+  getRecentAssistantMessages(
+    chatId: number,
+    limit?: number,
+  ): Promise<RecentAssistantMessage[]>;
+  getTelegramReplyContext(
+    chatId: number,
+    messageId: number,
+  ): Promise<TelegramReplyContext | null>;
+  recordOutgoingTelegramMessage(
+    updateId: number,
+    messageId: number,
+  ): Promise<void>;
 };
 
 export function createPersistenceFromEnv(): Persistence | null {
@@ -37,6 +60,87 @@ export function createPersistenceFromEnv(): Persistence | null {
 
 export function createPersistence(client: SupabaseRestClient): Persistence {
   return {
+    async getTelegramReplyContext(chatId, messageId) {
+      const rows = await client.select("assistant_messages", {
+        columns: ["agent_role", "text"],
+        equals: {
+          telegram_chat_id: chatId,
+          telegram_message_id: messageId,
+          direction: "outbound",
+        },
+        limit: 1,
+      });
+      const row = rows[0];
+
+      if (
+        (row?.agent_role !== "assistant" &&
+          row?.agent_role !== "project") ||
+        typeof row.text !== "string" ||
+        !row.text.trim()
+      ) {
+        return null;
+      }
+
+      return {
+        role: row.agent_role,
+        text: row.text.trim().slice(0, 4_000),
+      };
+    },
+
+    async recordOutgoingTelegramMessage(updateId, messageId) {
+      const rows = await client.update(
+        "assistant_messages",
+        { telegram_message_id: messageId },
+        {
+          telegram_update_id: String(updateId),
+          direction: "outbound",
+        },
+      );
+
+      if (rows.length === 0) {
+        throw new Error("Outbound Telegram message record was not found.");
+      }
+    },
+
+    async getRecentAssistantMessages(chatId, limit = 12) {
+      const safeLimit = Math.min(Math.max(Math.trunc(limit), 1), 30);
+      const rows = await client.select("assistant_messages", {
+        columns: ["direction", "text", "created_at"],
+        equals: {
+          telegram_chat_id: chatId,
+          agent_role: "assistant",
+        },
+        orderBy: {
+          column: "created_at",
+          ascending: false,
+        },
+        limit: safeLimit,
+      });
+
+      return rows
+        .flatMap((row): RecentAssistantMessage[] => {
+          if (
+            (row.direction !== "inbound" &&
+              row.direction !== "outbound") ||
+            typeof row.text !== "string" ||
+            !row.text.trim()
+          ) {
+            return [];
+          }
+
+          return [
+            {
+              role: row.direction === "inbound" ? "user" : "assistant",
+              text: row.text.trim().slice(0, 2_000),
+              ...(typeof row.created_at === "string"
+                ? { createdAt: row.created_at }
+                : {}),
+            },
+          ];
+        })
+        .reverse();
+    },
+
     async claimTelegramUpdate(context) {
       const result = await client.rpc("claim_telegram_update", {
         p_update_id: context.updateId,
@@ -89,6 +193,13 @@ export function createPersistence(client: SupabaseRestClient): Persistence {
         userId,
         role,
         traceId: envelope.traceId,
+      });
+      await upsertOutboundMessage(client, {
+        context,
+        userId,
+        role,
+        traceId: envelope.traceId,
+        responseText,
       });
 
       for (const run of envelope.runs) {
@@ -286,6 +397,35 @@ async function upsertInboundMessage(
   );
 
   return requireString(rows[0]?.id, "message id");
+}
+
+async function upsertOutboundMessage(
+  client: SupabaseRestClient,
+  input: {
+    context: TelegramPersistenceContext;
+    userId: string;
+    role: "assistant" | "project";
+    traceId: string;
+    responseText: string;
+  },
+) {
+  await client.upsert(
+    "assistant_messages",
+    {
+      telegram_update_id: input.context.updateId,
+      user_id: input.userId,
+      telegram_chat_id: input.context.chatId,
+      telegram_message_id: input.context.messageId,
+      direction: "outbound",
+      agent_role: input.role,
+      trace_id: input.traceId,
+      text: input.responseText,
+      metadata: {
+        reply_to_telegram_message_id: input.context.messageId,
+      },
+    },
+    { onConflict: "telegram_update_id,direction" },
+  );
 }
 
 async function upsertAuditLog(

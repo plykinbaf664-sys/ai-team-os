@@ -6,6 +6,7 @@ import {
   type RootAgentRole,
 } from "./agent-registry";
 import { runAssistantPipeline } from "./assistant/assistant-core";
+import type { AssistantConversationMessage } from "./assistant/types";
 import { runProjectPipeline } from "./project/project-core";
 import { canCallAgent } from "./loop-guard";
 import type {
@@ -63,9 +64,12 @@ type OpenAIResponse = {
 export async function routeRootAgentMessage(input: {
   role: RootAgentRole;
   text: string;
+  conversation?: AssistantConversationMessage[];
 }): Promise<RouteAgentMessageResult> {
   if (input.role === "assistant") {
-    const pipeline = await runAssistantPipeline(input.text);
+    const pipeline = await runAssistantPipeline(input.text, {
+      conversation: input.conversation,
+    });
     const traceId = createRuntimeId("trace");
     const rootRunId = createRuntimeId("run");
 

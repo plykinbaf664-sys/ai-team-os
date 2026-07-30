@@ -9,6 +9,7 @@ import {
   parseSpokenAssistantRequest,
   parseTelegramAgentRequest,
   parseTelegramUpdate,
+  type TelegramReplyAgentContext,
 } from "@/lib/telegram/update-parser";
 import { downloadTelegramVoice } from "@/lib/telegram/voice-file";
 
@@ -79,6 +80,12 @@ export async function POST(request: Request) {
     return Response.json({ ok: true, ignored: "duplicate_update" });
   }
 
+  const replyContext = await loadTelegramReplyContext(
+    persistence,
+    message.chat.id,
+    message.reply_to_message?.message_id,
+  );
+
   if (message.voice) {
     return handleAssistantVoice({
       updateId: update.update_id,
@@ -88,11 +95,14 @@ export async function POST(request: Request) {
       durationSeconds: message.voice.duration,
       persistence,
       persistenceContext,
-      requireSpokenInvocation: message.chat.type !== "private",
+      replyContext,
+      requireSpokenInvocation:
+        message.chat.type !== "private" &&
+        replyContext?.role !== "assistant",
     });
   }
 
-  const agentRequest = parseTelegramAgentRequest(message);
+  const agentRequest = parseTelegramAgentRequest(message, replyContext);
 
   if (!agentRequest) {
     if (persistence) {
@@ -115,7 +125,27 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = await routeRootAgentMessage(agentRequest);
+    const conversation =
+      agentRequest.role === "assistant"
+        ? appendReplyContext(
+            await loadAssistantConversation(
+              persistence,
+              message.chat.id,
+            ),
+            agentRequest.replyToText,
+          )
+        : undefined;
+    const result = await routeRootAgentMessage({
+      role: agentRequest.role,
+      text:
+        agentRequest.role === "project" && agentRequest.replyToText
+          ? formatProjectReplyText(
+              agentRequest.replyToText,
+              agentRequest.text,
+            )
+          : agentRequest.text,
+      conversation,
+    });
 
     if (!result.persistence) {
       throw new Error("Root agent result is missing persistence data.");
@@ -130,13 +160,17 @@ export async function POST(request: Request) {
       });
     }
 
-    await sendTelegramMessage({
+    const sentMessage = await sendTelegramMessage({
       chatId: message.chat.id,
       text: result.text,
       replyToMessageId: message.message_id,
     });
 
     if (persistence) {
+      await persistence.recordOutgoingTelegramMessage(
+        update.update_id,
+        sentMessage.messageId,
+      );
       await persistence.completeTelegramUpdate(
         update.update_id,
         result.persistence.traceId,
@@ -213,6 +247,7 @@ async function handleAssistantVoice({
   durationSeconds,
   persistence,
   persistenceContext,
+  replyContext,
   requireSpokenInvocation,
 }: {
   updateId: number;
@@ -222,6 +257,7 @@ async function handleAssistantVoice({
   durationSeconds: number;
   persistence: ReturnType<typeof createPersistenceFromEnv>;
   persistenceContext: TelegramPersistenceContext;
+  replyContext?: TelegramReplyAgentContext | null;
   requireSpokenInvocation: boolean;
 }) {
   let transcript: string | undefined;
@@ -279,6 +315,15 @@ async function handleAssistantVoice({
     const result = await routeRootAgentMessage({
       role: "assistant",
       text: assistantText,
+      conversation: appendReplyContext(
+        await loadAssistantConversation(
+          persistence,
+          chatId,
+        ),
+        replyContext?.role === "assistant"
+          ? replyContext.text
+          : undefined,
+      ),
     });
 
     if (!result.persistence) {
@@ -294,13 +339,17 @@ async function handleAssistantVoice({
       });
     }
 
-    await sendTelegramMessage({
+    const sentMessage = await sendTelegramMessage({
       chatId,
       text: result.text,
       replyToMessageId: messageId,
     });
 
     if (persistence) {
+      await persistence.recordOutgoingTelegramMessage(
+        updateId,
+        sentMessage.messageId,
+      );
       await persistence.completeTelegramUpdate(
         updateId,
         result.persistence.traceId,
@@ -350,6 +399,73 @@ async function handleAssistantVoice({
       error: "voice_processing_failed",
     });
   }
+}
+
+async function loadAssistantConversation(
+  persistence: ReturnType<typeof createPersistenceFromEnv>,
+  chatId: number,
+) {
+  if (!persistence) {
+    return [];
+  }
+
+  try {
+    return await persistence.getRecentAssistantMessages(chatId, 12);
+  } catch (error) {
+    console.error("Assistant conversation context load failed", error);
+    return [];
+  }
+}
+
+async function loadTelegramReplyContext(
+  persistence: ReturnType<typeof createPersistenceFromEnv>,
+  chatId: number,
+  messageId?: number,
+) {
+  if (!persistence || messageId === undefined) {
+    return null;
+  }
+
+  try {
+    return await persistence.getTelegramReplyContext(chatId, messageId);
+  } catch (error) {
+    console.error("Telegram reply context load failed", error);
+    return null;
+  }
+}
+
+function appendReplyContext(
+  conversation: Awaited<ReturnType<typeof loadAssistantConversation>>,
+  replyToText?: string,
+) {
+  if (
+    !replyToText ||
+    conversation.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.text === replyToText,
+    )
+  ) {
+    return conversation;
+  }
+
+  return [
+    ...conversation,
+    {
+      role: "assistant" as const,
+      text: replyToText,
+    },
+  ];
+}
+
+function formatProjectReplyText(replyToText: string, userText: string) {
+  return [
+    "Контекст сообщения Project Agent, на которое отвечает пользователь:",
+    replyToText,
+    "",
+    "Ответ пользователя:",
+    userText,
+  ].join("\n");
 }
 
 function getErrorMessage(error: unknown) {

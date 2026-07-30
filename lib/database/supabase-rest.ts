@@ -12,6 +12,16 @@ type WriteOptions = {
   onConflict?: string;
 };
 
+type SelectOptions = {
+  columns: string[];
+  equals?: Record<string, string | number | boolean>;
+  orderBy?: {
+    column: string;
+    ascending?: boolean;
+  };
+  limit?: number;
+};
+
 export class SupabaseRestError extends Error {
   readonly status: number;
   readonly responseBody: string;
@@ -29,6 +39,7 @@ export class SupabaseRestError extends Error {
 }
 
 export type SupabaseRestClient = {
+  select(table: string, options: SelectOptions): Promise<JsonObject[]>;
   insert(table: string, rows: JsonObject | JsonObject[]): Promise<JsonObject[]>;
   upsert(
     table: string,
@@ -80,6 +91,37 @@ export function createSupabaseRestClient({
   }
 
   return {
+    async select(table, options) {
+      const query = new URLSearchParams({
+        select: options.columns.join(","),
+      });
+
+      for (const [key, value] of Object.entries(options.equals ?? {})) {
+        query.set(key, `eq.${String(value)}`);
+      }
+
+      if (options.orderBy) {
+        query.set(
+          "order",
+          `${options.orderBy.column}.${options.orderBy.ascending ? "asc" : "desc"}`,
+        );
+      }
+
+      if (options.limit !== undefined) {
+        query.set("limit", String(options.limit));
+      }
+
+      const result = await request(
+        `/${encodeURIComponent(table)}?${query.toString()}`,
+        {
+          method: "GET",
+          headers: baseHeaders,
+        },
+      );
+
+      return ensureRows(result);
+    },
+
     async insert(table, rows) {
       const result = await request(`/${encodeURIComponent(table)}`, {
         method: "POST",

@@ -4,6 +4,7 @@ import { createGoogleAccessTokenProvider } from "../lib/integrations/google-shee
 import {
   buildBlueprintRequests,
   createGoogleSheetsAdapter,
+  createGoogleSheetsAdapterFromEnv,
 } from "../lib/integrations/google-sheets/google-sheets-adapter";
 import { createOwnProjectOperationsBlueprint } from "../lib/integrations/google-sheets/launch-tracker-blueprint";
 
@@ -33,6 +34,136 @@ test("refreshes and caches a Google OAuth access token", async () => {
   assert.equal(calls, 1);
 });
 
+test("finds existing spreadsheets by exact title ignoring letter case", async () => {
+  const urls: string[] = [];
+  const adapter = createGoogleSheetsAdapter({
+    getAccessToken: async () => "access-token",
+    fetchImplementation: (async (input) => {
+      urls.push(String(input));
+
+      return Response.json({
+        files: [
+          {
+            id: "existing-1",
+            name: "Финансы '2026",
+            webViewLink:
+              "https://docs.google.com/spreadsheets/d/existing-1/edit",
+            modifiedTime: "2026-07-29T10:00:00Z",
+          },
+        ],
+      });
+    }) as typeof fetch,
+  });
+
+  const matches = await adapter.findSpreadsheetsByTitle("финансы '2026");
+  const query = new URL(urls[0]).searchParams.get("q");
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].spreadsheetId, "existing-1");
+  assert.doesNotMatch(query || "", /name=/);
+  assert.match(query || "", /mimeType=/);
+  assert.match(query || "", /trashed=false/);
+});
+
+test("reads metadata and a bounded range from an existing spreadsheet", async () => {
+  const urls: string[] = [];
+  const responses = [
+    {
+      spreadsheetId: "existing-1",
+      spreadsheetUrl:
+        "https://docs.google.com/spreadsheets/d/existing-1/edit",
+      properties: {
+        title: "Финансы 2026",
+        locale: "ru_RU",
+        timeZone: "Europe/Moscow",
+      },
+      sheets: [
+        {
+          properties: {
+            sheetId: 10,
+            title: "Расходы",
+            gridProperties: {
+              rowCount: 100,
+              columnCount: 8,
+              frozenRowCount: 1,
+            },
+          },
+        },
+      ],
+    },
+    {
+      spreadsheetId: "existing-1",
+      properties: { title: "Финансы 2026" },
+      sheets: [
+        {
+          properties: {
+            sheetId: 10,
+            title: "Расходы",
+            gridProperties: { rowCount: 100, columnCount: 8 },
+          },
+        },
+      ],
+    },
+    {
+      range: "Расходы!A1:B2",
+      values: [
+        ["Категория", "Сумма"],
+        ["Реклама", "1000"],
+      ],
+    },
+  ];
+  const adapter = createGoogleSheetsAdapter({
+    getAccessToken: async () => "access-token",
+    fetchImplementation: (async (input) => {
+      urls.push(String(input));
+      return Response.json(responses.shift() ?? {});
+    }) as typeof fetch,
+  });
+
+  const metadata = await adapter.getSpreadsheetMetadata("existing-1");
+  const range = await adapter.readRange({
+    spreadsheetId: "existing-1",
+    range: "Расходы!A1:B2",
+  });
+
+  assert.equal(metadata.tabs[0].title, "Расходы");
+  assert.equal(metadata.tabs[0].frozenRowCount, 1);
+  assert.deepEqual(range.values[1], ["Реклама", "1000"]);
+  assert.match(urls[2], /valueRenderOption=FORMATTED_VALUE/);
+});
+
+test("rejects unbounded reads before requesting cell values", async () => {
+  let calls = 0;
+  const adapter = createGoogleSheetsAdapter({
+    getAccessToken: async () => "access-token",
+    fetchImplementation: (async () => {
+      calls += 1;
+      return Response.json({
+        spreadsheetId: "existing-1",
+        properties: { title: "Финансы 2026" },
+        sheets: [
+          {
+            properties: {
+              sheetId: 10,
+              title: "Расходы",
+              gridProperties: { rowCount: 100, columnCount: 8 },
+            },
+          },
+        ],
+      });
+    }) as typeof fetch,
+  });
+
+  await assert.rejects(
+    adapter.readRange({
+      spreadsheetId: "existing-1",
+      range: "Расходы!A:A",
+    }),
+    /must be bounded/,
+  );
+  assert.equal(calls, 1);
+});
+
 test("builds a complete own-project operations blueprint", () => {
   const blueprint = createOwnProjectOperationsBlueprint(
     "Мой проект",
@@ -47,6 +178,10 @@ test("builds a complete own-project operations blueprint", () => {
   assert.equal(blueprint.tabs[0].dropdowns.length, 2);
   assert.equal(blueprint.tabs[2].charts.length, 2);
   assert.equal(blueprint.timeZone, "Europe/Moscow");
+  assert.equal(blueprint.version, 2);
+  assert.equal(blueprint.tabs[2].hideGridlines, true);
+  assert.ok(blueprint.tabs.every((tab) => tab.styles.length > 0));
+  assert.ok(blueprint.tabs.every((tab) => tab.borders.length > 0));
 });
 
 test("compiles blueprint into valid single-operation batch requests", () => {
@@ -59,6 +194,9 @@ test("compiles blueprint into valid single-operation batch requests", () => {
   assert.ok(requestTypes.some((keys) => keys[0] === "updateCells"));
   assert.ok(requestTypes.some((keys) => keys[0] === "setBasicFilter"));
   assert.ok(requestTypes.some((keys) => keys[0] === "setDataValidation"));
+  assert.ok(requestTypes.some((keys) => keys[0] === "mergeCells"));
+  assert.ok(requestTypes.some((keys) => keys[0] === "addBanding"));
+  assert.ok(requestTypes.some((keys) => keys[0] === "updateBorders"));
   assert.ok(
     requestTypes.some((keys) => keys[0] === "addConditionalFormatRule"),
   );
@@ -70,12 +208,49 @@ test("compiles blueprint into valid single-operation batch requests", () => {
     requestTypes.at(-1)?.[0],
     "createDeveloperMetadata",
   );
-  assert.match(JSON.stringify(requests), /IFERROR\(D2\/C2;0\)/);
+  assert.match(JSON.stringify(requests), /IFERROR\(D4\/C4;0\)/);
   assert.match(
     JSON.stringify(requests),
-    /AND\(\$C2<TODAY\(\);\$C2<>\\"\\";\$E2<>\\"Готово\\"\)/,
+    /AND\(\$C4<TODAY\(\);\$C4<>\\"\\";\$E4<>\\"Готово\\"\)/,
   );
-  assert.match(JSON.stringify(requests), /\$F2<0,8/);
+  assert.match(JSON.stringify(requests), /\$F4<0,8/);
+  assert.match(JSON.stringify(requests), /ARRAYFORMULA/);
+  assert.match(JSON.stringify(requests), /hideGridlines/);
+});
+
+test("compiles supported person and Drive file smart chips", () => {
+  const blueprint = createOwnProjectOperationsBlueprint(
+    "Мой проект",
+    "Europe/Moscow",
+  );
+  blueprint.tabs[0].values.push({
+    startRowIndex: 210,
+    startColumnIndex: 0,
+    rows: [
+      [
+        {
+          chip: {
+            type: "person",
+            email: "owner@example.com",
+          },
+        },
+        {
+          chip: {
+            type: "drive_file",
+            uri: "https://drive.google.com/file/d/file-id/view",
+          },
+        },
+      ],
+    ],
+  });
+
+  const requests = buildBlueprintRequests(blueprint);
+  const serialized = JSON.stringify(requests);
+
+  assert.match(serialized, /chipRuns/);
+  assert.match(serialized, /personProperties/);
+  assert.match(serialized, /richLinkProperties/);
+  assert.match(serialized, /owner@example\.com/);
 });
 
 test("creates and marks a spreadsheet idempotently", async () => {
@@ -157,7 +332,7 @@ test("reuses a spreadsheet with an applied blueprint marker", async () => {
       developerMetadata: [
         {
           metadataKey: "ai_team_os_blueprint",
-          metadataValue: "own-project-operations-v1:v1",
+          metadataValue: "own-project-operations-v2:v2",
         },
       ],
     },
@@ -180,3 +355,23 @@ test("reuses a spreadsheet with an applied blueprint marker", async () => {
   assert.equal(urls.length, 3);
   assert.ok(!urls.some((url) => url.endsWith(":batchUpdate")));
 });
+
+test(
+  "live Drive search resolves a spoken lowercase sheet title",
+  { skip: process.env.RUN_LIVE_GOOGLE_TEST !== "1" },
+  async () => {
+    const adapter = createGoogleSheetsAdapterFromEnv();
+    assert.ok(adapter);
+
+    const matches = await adapter.findSpreadsheetsByTitle("мои материалы");
+
+    assert.ok(
+      matches.some(
+        (match) =>
+          match.title.localeCompare("Мои материалы", undefined, {
+            sensitivity: "base",
+          }) === 0,
+      ),
+    );
+  },
+);

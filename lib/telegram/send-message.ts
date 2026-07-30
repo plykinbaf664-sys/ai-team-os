@@ -7,27 +7,33 @@ type SendTelegramMessageInput = {
 type TelegramSendMessageResponse = {
   ok: boolean;
   description?: string;
+  result?: {
+    message_id?: number;
+  };
 };
 
 export async function sendTelegramMessage({
   chatId,
   text,
   replyToMessageId,
-}: SendTelegramMessageInput) {
+}: SendTelegramMessageInput, fetchImplementation: typeof fetch = fetch) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
 
   if (!botToken) {
     throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   }
 
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+  const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const formatted = formatTelegramMessage(text);
+  const response = await fetchImplementation(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       chat_id: chatId,
-      text,
+      text: formatted.html,
+      parse_mode: "HTML",
       reply_to_message_id: replyToMessageId,
       disable_web_page_preview: true,
     }),
@@ -36,8 +42,54 @@ export async function sendTelegramMessage({
   const data = (await response.json()) as TelegramSendMessageResponse;
 
   if (!response.ok || !data.ok) {
+    if (isEntityFormattingError(data.description)) {
+      const fallbackResponse = await fetchImplementation(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: formatted.plain,
+          reply_to_message_id: replyToMessageId,
+          disable_web_page_preview: true,
+        }),
+      });
+      const fallbackData =
+        (await fallbackResponse.json()) as TelegramSendMessageResponse;
+
+      if (fallbackResponse.ok && fallbackData.ok) {
+        return {
+          messageId: requireTelegramMessageId(fallbackData),
+        };
+      }
+
+      throw new Error(
+        fallbackData.description || "Telegram sendMessage failed.",
+      );
+    }
+
     throw new Error(data.description || "Telegram sendMessage failed.");
   }
 
-  return data;
+  return {
+    messageId: requireTelegramMessageId(data),
+  };
 }
+
+function requireTelegramMessageId(data: TelegramSendMessageResponse) {
+  const messageId = data.result?.message_id;
+
+  if (!Number.isSafeInteger(messageId)) {
+    throw new Error("Telegram sendMessage response is missing message_id.");
+  }
+
+  return messageId as number;
+}
+
+function isEntityFormattingError(description?: string) {
+  return /can't parse entities|unsupported start tag|wrong entity/i.test(
+    description ?? "",
+  );
+}
+import { formatTelegramMessage } from "./message-format";

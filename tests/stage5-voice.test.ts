@@ -115,6 +115,9 @@ test("sends audio to the OpenAI transcription endpoint", async () => {
 test("persists voice transcript fields", async () => {
   const upserts: Array<{ table: string; rows: unknown; onConflict?: string }> = [];
   const client: SupabaseRestClient = {
+    async select() {
+      return [];
+    },
     async insert() {
       return [];
     },

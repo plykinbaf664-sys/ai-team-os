@@ -2,12 +2,19 @@ import type { RootAgentRole } from "@/lib/agents/agent-registry";
 import type {
   TelegramChat,
   TelegramMessage,
+  TelegramMessageReference,
   TelegramUpdate,
   TelegramUser,
   TelegramVoice,
 } from "./types";
 
 export type ParsedTelegramAgentRequest = {
+  role: RootAgentRole;
+  text: string;
+  replyToText?: string;
+};
+
+export type TelegramReplyAgentContext = {
   role: RootAgentRole;
   text: string;
 };
@@ -47,6 +54,7 @@ export function parseTelegramUpdate(value: unknown): TelegramUpdate | null {
 
 export function parseTelegramAgentRequest(
   message: TelegramMessage,
+  replyContext?: TelegramReplyAgentContext | null,
 ): ParsedTelegramAgentRequest | null {
   const text = message.text?.trim();
 
@@ -58,6 +66,14 @@ export function parseTelegramAgentRequest(
 
   if (explicitRequest) {
     return explicitRequest;
+  }
+
+  if (replyContext) {
+    return {
+      role: replyContext.role,
+      text,
+      replyToText: replyContext.text,
+    };
   }
 
   if (message.chat.type === "private") {
@@ -74,14 +90,18 @@ function parseExplicitAgentRequest(
   text: string,
 ): ParsedTelegramAgentRequest | null {
   const match = text.match(
-    /^\/?(assistant|project)(?:@\w+)?(?:[\s,;:—-]+([\s\S]+))?$/i,
+    /^\/?(assistant|ассистент|project|проект)(?:@\w+)?(?:[\s,;:—-]+([\s\S]+))?$/iu,
   );
 
   if (!match) {
     return null;
   }
 
-  const role = match[1].toLowerCase() as RootAgentRole;
+  const alias = match[1].toLowerCase();
+  const role: RootAgentRole =
+    alias === "assistant" || alias === "ассистент"
+      ? "assistant"
+      : "project";
 
   return {
     role,
@@ -109,6 +129,7 @@ function parseTelegramMessage(value: unknown): TelegramMessage | null {
 
   let from: TelegramUser | undefined;
   let voice: TelegramVoice | undefined;
+  let replyToMessage: TelegramMessageReference | undefined;
 
   if (value.from !== undefined) {
     const parsedUser = parseTelegramUser(value.from);
@@ -130,11 +151,52 @@ function parseTelegramMessage(value: unknown): TelegramMessage | null {
     voice = parsedVoice;
   }
 
+  if (value.reply_to_message !== undefined) {
+    const parsedReply = parseTelegramMessageReference(value.reply_to_message);
+
+    if (!parsedReply) {
+      return null;
+    }
+
+    replyToMessage = parsedReply;
+  }
+
   return {
     message_id: value.message_id,
     text: value.text,
     voice,
+    reply_to_message: replyToMessage,
     chat,
+    from,
+  };
+}
+
+function parseTelegramMessageReference(
+  value: unknown,
+): TelegramMessageReference | null {
+  if (
+    !isObject(value) ||
+    !isInteger(value.message_id) ||
+    (value.text !== undefined && typeof value.text !== "string")
+  ) {
+    return null;
+  }
+
+  let from: TelegramUser | undefined;
+
+  if (value.from !== undefined) {
+    const parsedUser = parseTelegramUser(value.from);
+
+    if (!parsedUser) {
+      return null;
+    }
+
+    from = parsedUser;
+  }
+
+  return {
+    message_id: value.message_id,
+    text: value.text,
     from,
   };
 }

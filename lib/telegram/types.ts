@@ -7,7 +7,14 @@ export type TelegramMessage = {
   message_id: number;
   text?: string;
   voice?: TelegramVoice;
+  reply_to_message?: TelegramMessageReference;
   chat: TelegramChat;
+  from?: TelegramUser;
+};
+
+export type TelegramMessageReference = {
+  message_id: number;
+  text?: string;
   from?: TelegramUser;
 };
 
