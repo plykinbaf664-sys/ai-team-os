@@ -194,6 +194,108 @@ export type SheetRangeRead = {
   values: SheetScalar[][];
 };
 
+export type SheetColumnRole =
+  | "key"
+  | "metric"
+  | "status"
+  | "text"
+  | "formula"
+  | "unknown";
+
+export type SheetColumnDataType =
+  | "string"
+  | "number"
+  | "boolean"
+  | "date"
+  | "mixed"
+  | "empty";
+
+export type SheetUpdatePolicy =
+  | "preserve"
+  | "increment"
+  | "replace"
+  | "append_text"
+  | "formula"
+  | "protected";
+
+export type SheetColumnProfile = {
+  index: number;
+  columnLetter: string;
+  header: string;
+  semanticKey: string;
+  role: SheetColumnRole;
+  dataType: SheetColumnDataType;
+  updatePolicy: SheetUpdatePolicy;
+  isFormula: boolean;
+  isProtected: boolean;
+};
+
+export type SheetRowMatchingRule = {
+  keyColumns: string[];
+  minimumConfidence: number;
+  ambiguityDelta: number;
+};
+
+export type SheetProfile = {
+  version: 1;
+  spreadsheetId: string;
+  sheetId: number;
+  sheetName: string;
+  purpose: string;
+  entityType:
+    | "outreach_segment"
+    | "task"
+    | "metric_record"
+    | "activity_log"
+    | "generic_table";
+  headerRowNumber: number;
+  columns: SheetColumnProfile[];
+  keyColumns: string[];
+  metricColumns: string[];
+  statusColumns: string[];
+  textColumns: string[];
+  formulaColumns: string[];
+  protectedColumns: string[];
+  rowMatchingRules: SheetRowMatchingRule;
+  projectId?: string;
+  linkedTickTickProjectId?: string;
+  fingerprint: string;
+};
+
+export type SheetRowEntity = {
+  entityId: string;
+  rowNumber: number;
+  rowKey: string;
+  normalizedKey: string;
+  aliases: string[];
+  values: SheetScalar[];
+};
+
+export type SheetRowMatch = {
+  entity: SheetRowEntity;
+  confidence: number;
+  evidence: string[];
+};
+
+export type SheetGridMetadata = {
+  spreadsheetId: string;
+  sheetId: number;
+  sheetName: string;
+  formulaColumns: number[];
+  protectedColumns: number[];
+  formulaCells?: Array<{
+    rowIndex: number;
+    columnIndex: number;
+    formula: string;
+  }>;
+  protectedRanges?: Array<{
+    startRowIndex?: number;
+    endRowIndex?: number;
+    startColumnIndex?: number;
+    endColumnIndex?: number;
+  }>;
+};
+
 export type GoogleSheetsAdapter = {
   createSpreadsheet(
     blueprint: GoogleSheetBlueprint,
@@ -202,6 +304,7 @@ export type GoogleSheetsAdapter = {
   findSpreadsheetsByTitle(
     title: string,
   ): Promise<ExistingSpreadsheetSummary[]>;
+  listSpreadsheets(): Promise<ExistingSpreadsheetSummary[]>;
   getSpreadsheetMetadata(
     spreadsheetId: string,
   ): Promise<ExistingSpreadsheetMetadata>;
@@ -209,6 +312,10 @@ export type GoogleSheetsAdapter = {
     spreadsheetId: string;
     range: string;
   }): Promise<SheetRangeRead>;
+  readSheetGridMetadata(input: {
+    spreadsheetId: string;
+    range: string;
+  }): Promise<SheetGridMetadata>;
   createSheetTab(input: {
     spreadsheetId: string;
     title: string;
@@ -218,7 +325,7 @@ export type GoogleSheetsAdapter = {
     range: string;
     values: SheetScalar[][];
     idempotencyKey: string;
-  }): Promise<void>;
+  }): Promise<{ updatedRange?: string; reused: boolean }>;
   updateCells(input: {
     spreadsheetId: string;
     range: string;

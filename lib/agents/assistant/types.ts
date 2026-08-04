@@ -14,6 +14,16 @@ export type AssistantConversationMessage = {
 export type TaskPriority = "low" | "normal" | "high" | "urgent";
 export type SheetCellValue = string | number | boolean | null;
 
+export type TaskSourceEntity = {
+  type: "google_sheet_row";
+  spreadsheetId: string;
+  spreadsheetTitle?: string;
+  sheetName: string;
+  rowNumber: number;
+  entityId: string;
+  entityLabel?: string;
+};
+
 type Action<TType extends string, TPayload> = {
   id: string;
   type: TType;
@@ -57,6 +67,7 @@ export type CreateTaskAction = Action<
     dueDateText?: string;
     priority?: TaskPriority;
     project?: string;
+    sourceEntity?: TaskSourceEntity;
   }
 >;
 
@@ -216,11 +227,144 @@ export type AssistantAction =
   | AnalyzeMetricsAction
   | GenerateDailySummaryAction;
 
+export type StrategicFact = {
+  key: string;
+  value: string | number | boolean;
+  source: "message" | "project_context" | "resource_context" | "history";
+  evidence: string;
+};
+
+export type StrategicAssumption = {
+  text: string;
+  evidence: string;
+  confidence: number;
+};
+
+export type StrategicTargetResource = {
+  type: "google_sheet" | "ticktick_project" | "calendar" | "other";
+  externalId?: string;
+  title?: string;
+  sheetName?: string;
+  entityId?: string;
+  entityLabel?: string;
+  rowNumber?: number;
+};
+
+export type StrategicExecutionPolicy =
+  | "auto_execute"
+  | "suggest_first"
+  | "confirm_first";
+
+export type StrategicActionKind =
+  | "execute_action"
+  | "recalculate_metrics"
+  | "audit_log"
+  | "verify_result";
+
+export type StrategicAction = {
+  id: string;
+  kind: StrategicActionKind;
+  linkedActionId?: string;
+  actionType?: AssistantAction["type"];
+  reason: string;
+  evidence: string[];
+  confidence: number;
+  executionPolicy: StrategicExecutionPolicy;
+  expectedChange: string;
+  verification: string;
+};
+
+export type SuggestedAction = {
+  id: string;
+  title: string;
+  reason: string;
+  evidence: string[];
+  confidence: number;
+  proposedTask?: {
+    title: string;
+    dueDateText?: string;
+    priority?: TaskPriority;
+    project?: string;
+    sourceEntity?: TaskSourceEntity;
+  };
+};
+
+export type StrategicActionPlan = {
+  version: 1;
+  userGoal: string;
+  projectId: string | null;
+  targetResources: StrategicTargetResource[];
+  factsFromMessage: StrategicFact[];
+  factsFromContext: StrategicFact[];
+  assumptions: StrategicAssumption[];
+  actions: StrategicAction[];
+  suggestions: SuggestedAction[];
+  clarification?: {
+    question: string;
+    missingField: string;
+  };
+  summaryIntent: string;
+};
+
+export type ActionRiskLevel = "read" | "safe_write" | "sensitive_write" | "critical";
+
+export type ActionConfidenceDecision =
+  | "execute"
+  | "clarify"
+  | "confirm";
+
+export type ActionConfidenceAssessment = {
+  actionId: string;
+  risk: ActionRiskLevel;
+  confidence: number;
+  threshold: number;
+  decision: ActionConfidenceDecision;
+  evidence: string[];
+  question?: string;
+};
+
+export type ActionPlanPolicyEvaluation = {
+  assessments: ActionConfidenceAssessment[];
+  executableActionIds: string[];
+  blockedActionIds: string[];
+  clarificationQuestions: string[];
+};
+
+export type ProactiveFindingKind =
+  | "stale_segment"
+  | "missed_follow_up"
+  | "plan_fact_deviation"
+  | "missing_next_action"
+  | "inconsistent_data";
+
+export type ProactiveFinding = {
+  id: string;
+  kind: ProactiveFindingKind;
+  severity: "low" | "medium" | "high";
+  title: string;
+  recommendation: string;
+  evidence: string[];
+  spreadsheetId: string;
+  sheetName: string;
+  rowNumber: number;
+  entityId: string;
+  entityLabel: string;
+};
+
+export type ProactiveMonitoringReport = {
+  version: 1;
+  checkedAt: string;
+  scope: "relevant_context";
+  findings: ProactiveFinding[];
+};
+
 export type ActionPlan = {
   version: 1;
   mode: AssistantMode;
   sourceText: string;
   actions: AssistantAction[];
+  strategicPlan?: StrategicActionPlan;
+  monitoringReport?: ProactiveMonitoringReport;
 };
 
 export type ActionResult = {

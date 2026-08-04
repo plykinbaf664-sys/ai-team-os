@@ -3,6 +3,11 @@ import {
   type SupabaseRestClient,
 } from "./supabase-rest";
 import type {
+  AssistantProjectDetails,
+  AssistantProjectMemory,
+  AssistantProjectResource,
+} from "../agents/assistant/project-context";
+import type {
   AgentPersistenceEnvelope,
   JsonObject,
   TelegramPersistenceContext,
@@ -23,6 +28,12 @@ export type TelegramReplyContext = {
 };
 
 export type Persistence = {
+  getAssistantProjectMemory(
+    telegramUserId: number,
+  ): Promise<AssistantProjectMemory>;
+  getAssistantProjectDetails(
+    projectId: string,
+  ): Promise<AssistantProjectDetails>;
   claimTelegramUpdate(
     context: TelegramPersistenceContext,
   ): Promise<TelegramUpdateClaim>;
@@ -60,6 +71,152 @@ export function createPersistenceFromEnv(): Persistence | null {
 
 export function createPersistence(client: SupabaseRestClient): Persistence {
   return {
+    async getAssistantProjectMemory(telegramUserId) {
+      const userRows = await client.select("users", {
+        columns: ["id"],
+        equals: { telegram_user_id: telegramUserId },
+        limit: 1,
+      });
+      const userId = optionalString(userRows[0]?.id);
+
+      if (!userId) {
+        return { projects: [] };
+      }
+
+      const [settingsRows, projectRows] = await Promise.all([
+        client.select("user_settings", {
+          columns: [
+            "timezone",
+            "active_project_id",
+            "preferred_response_style",
+          ],
+          equals: { user_id: userId },
+          limit: 1,
+        }),
+        client.select("team_projects", {
+          columns: [
+            "id",
+            "name",
+            "status",
+            "metadata",
+            "updated_at",
+          ],
+          equals: { owner_user_id: userId },
+          orderBy: { column: "updated_at", ascending: false },
+          limit: 30,
+        }),
+      ]);
+      const projects = await Promise.all(
+        projectRows.flatMap((row) => {
+          const id = optionalString(row.id);
+          const name = optionalString(row.name);
+
+          if (!id || !name) {
+            return [];
+          }
+
+          return [loadProjectCandidate(client, row, id, name)];
+        }),
+      );
+      const settings = settingsRows[0];
+
+      return {
+        userId,
+        timezone: optionalString(settings?.timezone),
+        preferredResponseStyle: optionalString(
+          settings?.preferred_response_style,
+        ),
+        activeProjectId: optionalString(settings?.active_project_id),
+        projects,
+      };
+    },
+
+    async getAssistantProjectDetails(projectId) {
+      const [glossaryRows, ruleRows, decisionRows, actionRows] =
+        await Promise.all([
+          client.select("project_glossary", {
+            columns: ["term", "definition", "aliases"],
+            equals: { project_id: projectId, status: "active" },
+            orderBy: { column: "updated_at", ascending: false },
+            limit: 50,
+          }),
+          client.select("project_operating_rules", {
+            columns: ["rule_key", "rule_text", "priority"],
+            equals: { project_id: projectId, status: "active" },
+            orderBy: { column: "priority", ascending: false },
+            limit: 30,
+          }),
+          client.select("assistant_decisions", {
+            columns: ["decision", "rationale", "created_at"],
+            equals: { project_id: projectId, status: "active" },
+            orderBy: { column: "created_at", ascending: false },
+            limit: 12,
+          }),
+          client.select("action_requests", {
+            columns: ["action_type", "status", "payload", "created_at"],
+            equals: { project_id: projectId },
+            orderBy: { column: "created_at", ascending: false },
+            limit: 12,
+          }),
+        ]);
+
+      return {
+        glossary: glossaryRows.flatMap((row) => {
+          const term = optionalString(row.term);
+          const definition = optionalString(row.definition);
+          return term && definition
+            ? [
+                {
+                  term,
+                  definition,
+                  aliases: stringArray(row.aliases),
+                },
+              ]
+            : [];
+        }),
+        operatingRules: ruleRows.flatMap((row) => {
+          const key = optionalString(row.rule_key);
+          const text = optionalString(row.rule_text);
+          return key && text
+            ? [
+                {
+                  key,
+                  text,
+                  priority:
+                    typeof row.priority === "number" ? row.priority : 0,
+                },
+              ]
+            : [];
+        }),
+        decisions: decisionRows.flatMap((row) => {
+          const decision = optionalString(row.decision);
+          return decision
+            ? [
+                {
+                  decision,
+                  rationale: optionalString(row.rationale),
+                  createdAt: optionalString(row.created_at),
+                },
+              ]
+            : [];
+        }),
+        recentActions: actionRows.flatMap((row) => {
+          const actionType = optionalString(row.action_type);
+          const status = optionalString(row.status);
+          return actionType && status
+            ? [
+                {
+                  actionType,
+                  status,
+                  payload: isJsonObject(row.payload) ? row.payload : {},
+                  createdAt: optionalString(row.created_at),
+                },
+              ]
+            : [];
+        }),
+      };
+    },
+
     async getTelegramReplyContext(chatId, messageId) {
       const rows = await client.select("assistant_messages", {
         columns: ["agent_role", "text"],
@@ -234,6 +391,7 @@ export function createPersistence(client: SupabaseRestClient): Persistence {
             agent_run_id: envelope.rootRunId,
             message_id: messageId,
             action_type: action.actionType,
+            project_id: action.projectId ?? null,
             payload: action.payload,
             status: action.status,
             idempotency_key: idempotencyKey,
@@ -459,6 +617,104 @@ function requireString(value: unknown, field: string) {
   }
 
   return value;
+}
+
+async function loadProjectCandidate(
+  client: SupabaseRestClient,
+  row: JsonObject,
+  id: string,
+  name: string,
+) {
+  const resourceRows = await client.select("project_resources", {
+    columns: [
+      "id",
+      "project_id",
+      "resource_type",
+      "external_id",
+      "title",
+      "metadata",
+    ],
+    equals: { project_id: id, status: "active" },
+    orderBy: { column: "updated_at", ascending: false },
+    limit: 30,
+  });
+  const metadata = isJsonObject(row.metadata) ? row.metadata : {};
+
+  return {
+    id,
+    name,
+    status: optionalString(row.status) ?? "active",
+    goal: optionalString(metadata.goal),
+    stage: optionalString(metadata.stage),
+    kpis: metricList(metadata.kpis),
+    aliases: stringArray(metadata.aliases),
+    resources: resourceRows.flatMap(toProjectResource),
+    updatedAt: optionalString(row.updated_at),
+  };
+}
+
+function toProjectResource(row: JsonObject): AssistantProjectResource[] {
+  const id = optionalString(row.id);
+  const projectId = optionalString(row.project_id);
+  const resourceType = optionalString(row.resource_type);
+  const externalId = optionalString(row.external_id);
+  const title = optionalString(row.title);
+
+  if (
+    !id ||
+    !projectId ||
+    (resourceType !== "google_sheet" &&
+      resourceType !== "ticktick_project") ||
+    !externalId ||
+    !title
+  ) {
+    return [];
+  }
+
+  return [
+    {
+      id,
+      projectId,
+      resourceType,
+      externalId,
+      title,
+      metadata: isJsonObject(row.metadata) ? row.metadata : {},
+    },
+  ];
+}
+
+function metricList(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) =>
+      typeof entry === "string" && entry.trim() ? [entry.trim()] : [],
+    );
+  }
+
+  if (isJsonObject(value)) {
+    return Object.entries(value).map(
+      ([name, target]) => `${name}: ${String(target)}`,
+    );
+  }
+
+  return [];
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.flatMap((entry) =>
+        typeof entry === "string" && entry.trim() ? [entry.trim()] : [],
+      )
+    : [];
+}
+
+function optionalString(value: unknown) {
+  return typeof value === "string" && value.trim()
+    ? value.trim()
+    : undefined;
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function getErrorMessage(error: unknown) {

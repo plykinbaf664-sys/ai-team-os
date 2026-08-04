@@ -5,6 +5,20 @@ import type {
 } from "@/lib/agents/assistant/types";
 import { createGoogleSheetsAdapterFromEnv } from "@/lib/integrations/google-sheets/google-sheets-adapter";
 import {
+  formatGoogleSheetsWorkspaceContext,
+  inspectSpreadsheet,
+} from "@/lib/integrations/google-sheets/document-context";
+import {
+  buildSheetProfile,
+  columnName,
+  parseRangeColumnIndexes,
+} from "@/lib/integrations/google-sheets/sheet-profile";
+import {
+  buildSheetRowEntities,
+  isUnambiguousRowMatch,
+  matchSheetRows,
+} from "@/lib/integrations/google-sheets/row-matcher";
+import {
   createOwnProjectOperationsBlueprint,
   OWN_PROJECT_OPERATIONS_BLUEPRINT_ID,
 } from "@/lib/integrations/google-sheets/launch-tracker-blueprint";
@@ -13,6 +27,7 @@ import type {
   ExistingSpreadsheetSummary,
   GoogleSheetsAdapter,
 } from "@/lib/integrations/google-sheets/types";
+import { executeContextAwareSheetUpdate } from "./context-aware-sheet-executor";
 
 type GoogleSheetsAction = Extract<
   AssistantAction,
@@ -95,18 +110,17 @@ export async function executeGoogleSheetsAction(
         }
 
         if (!action.payload.range) {
+          const inspected = await inspectSpreadsheet(
+            adapter,
+            resolved.metadata,
+          );
+
           return success(
             action,
-            [
-              `Таблица «${resolved.metadata.title}».`,
-              resolved.metadata.spreadsheetUrl,
-              `Листы: ${resolved.metadata.tabs
-                .map(
-                  (tab) =>
-                    `${tab.title} (${tab.rowCount}×${tab.columnCount})`,
-                )
-                .join(", ")}.`,
-            ].join("\n"),
+            formatGoogleSheetsWorkspaceContext({
+              availableDocuments: [resolved.metadata],
+              inspectedDocuments: [inspected],
+            }),
           );
         }
 
@@ -201,7 +215,18 @@ export async function executeGoogleSheetsAction(
         }
 
         if (action.payload.operation === "append_rows") {
-          await adapter.appendRows({
+          const appendGuard = await guardEntityAppend({
+            adapter,
+            metadata: resolved.metadata,
+            range: action.payload.range,
+            values,
+          });
+
+          if (appendGuard) {
+            return needsClarification(action, appendGuard);
+          }
+
+          const appendResult = await adapter.appendRows({
             spreadsheetId,
             range: action.payload.range,
             values,
@@ -212,7 +237,61 @@ export async function executeGoogleSheetsAction(
               JSON.stringify(values),
             ].join(":"),
           });
-          return success(action, "Строки добавлены.");
+
+          if (appendResult.reused) {
+            return success(
+              action,
+              `Эта запись уже была выполнена ранее в таблице «${resolved.metadata.title}». Дубликат не создан.`,
+            );
+          }
+
+          if (appendResult.updatedRange) {
+            const verification = await adapter.readRange({
+              spreadsheetId,
+              range: appendResult.updatedRange,
+            });
+
+            if (verification.values.length < values.length) {
+              return failure(
+                action,
+                "Google Sheets сообщил о записи, но проверка добавленных строк не прошла.",
+                "sheet_write_verification_failed",
+              );
+            }
+          }
+
+          return success(
+            action,
+            [
+              `Данные добавлены в таблицу «${resolved.metadata.title}».`,
+              appendResult.updatedRange
+                ? `Проверенный диапазон: ${appendResult.updatedRange}.`
+                : `Диапазон: ${action.payload.range}.`,
+            ].join(" "),
+          );
+        }
+
+        const contextAwareResult = await executeContextAwareSheetUpdate({
+          action,
+          adapter,
+          metadata: resolved.metadata,
+        });
+
+        if (contextAwareResult) {
+          return contextAwareResult;
+        }
+
+        const protectedUpdate = await findProtectedUpdate({
+          adapter,
+          metadata: resolved.metadata,
+          range: action.payload.range,
+        });
+
+        if (protectedUpdate) {
+          return needsClarification(
+            action,
+            `Колонка «${protectedUpdate}» защищена от автоматической перезаписи. Для такого изменения нужно отдельное подтверждение.`,
+          );
         }
 
         await adapter.updateCells({
@@ -241,6 +320,140 @@ export async function executeGoogleSheetsAction(
       "google_sheets_failed",
     );
   }
+}
+
+async function guardEntityAppend({
+  adapter,
+  metadata,
+  range,
+  values,
+}: {
+  adapter: GoogleSheetsAdapter;
+  metadata: ExistingSpreadsheetMetadata;
+  range: string;
+  values: Array<Array<string | number | boolean | null>>;
+}) {
+  if (values.length !== 1) {
+    return null;
+  }
+
+  const context = await loadTargetSheetProfile(adapter, metadata, range);
+
+  if (
+    !context ||
+    (context.profile.entityType !== "outreach_segment" &&
+      context.profile.entityType !== "task")
+  ) {
+    return null;
+  }
+
+  const keyValues = context.profile.keyColumns.flatMap((semanticKey) => {
+    const column = context.profile.columns.find(
+      (candidate) => candidate.semanticKey === semanticKey,
+    );
+    const value = column ? values[0][column.index] : null;
+    return value === null || value === undefined || value === ""
+      ? []
+      : [String(value)];
+  });
+
+  if (!keyValues.length) {
+    return null;
+  }
+
+  const matches = matchSheetRows(keyValues.join(" "), context.entities);
+
+  if (!isUnambiguousRowMatch(matches, context.profile)) {
+    return null;
+  }
+
+  return `Нашёл существующую строку «${matches[0].entity.rowKey}» — новую не добавил, чтобы не создать дубль. Уточни только смысл числа: прибавить его к текущему факту или заменить текущее значение?`;
+}
+
+async function findProtectedUpdate({
+  adapter,
+  metadata,
+  range,
+}: {
+  adapter: GoogleSheetsAdapter;
+  metadata: ExistingSpreadsheetMetadata;
+  range: string;
+}) {
+  const columns = parseRangeColumnIndexes(range);
+
+  if (!columns) {
+    return null;
+  }
+
+  const context = await loadTargetSheetProfile(adapter, metadata, range);
+
+  if (!context) {
+    return null;
+  }
+
+  return (
+    context.profile.columns.find(
+      (column) =>
+        column.index >= columns.start &&
+        column.index <= columns.end &&
+        column.isProtected,
+    )?.header ?? null
+  );
+}
+
+async function loadTargetSheetProfile(
+  adapter: GoogleSheetsAdapter,
+  metadata: ExistingSpreadsheetMetadata,
+  range: string,
+) {
+  const sheetName = extractSheetTitle(range);
+  const tab = metadata.tabs.find((candidate) => candidate.title === sheetName);
+
+  if (!tab) {
+    return null;
+  }
+
+  const rowCount = Math.max(1, Math.min(tab.rowCount, 30));
+  const columnCount = Math.max(1, Math.min(tab.columnCount, 12));
+  const sampleRange = `${quoteSheetTitle(tab.title)}!A1:${columnName(columnCount - 1)}${rowCount}`;
+
+  try {
+    const [sample, gridMetadata] = await Promise.all([
+      adapter.readRange({
+        spreadsheetId: metadata.spreadsheetId,
+        range: sampleRange,
+      }),
+      adapter.readSheetGridMetadata({
+        spreadsheetId: metadata.spreadsheetId,
+        range: sampleRange,
+      }),
+    ]);
+    const profile = buildSheetProfile({
+      spreadsheet: metadata,
+      tab,
+      values: sample.values,
+      gridMetadata,
+    });
+
+    return {
+      profile,
+      entities: buildSheetRowEntities(profile, sample.values),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractSheetTitle(range: string) {
+  const rawTitle = range.slice(0, range.indexOf("!"));
+
+  return rawTitle.startsWith("'") && rawTitle.endsWith("'")
+    ? rawTitle.slice(1, -1).replace(/''/g, "'")
+    : rawTitle;
+}
+
+function quoteSheetTitle(title: string) {
+  return `'${title.replace(/'/g, "''")}'`;
 }
 
 function isGoogleSheetsAction(

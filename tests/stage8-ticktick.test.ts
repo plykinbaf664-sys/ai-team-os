@@ -50,6 +50,7 @@ function fakeAdapter({
       id: "created-task",
       projectId: input.projectId,
       title: input.title,
+      content: input.content,
       priority: input.priority ?? 0,
       dueDate: input.dueDate,
       timeZone: input.timeZone,
@@ -119,6 +120,7 @@ test("uses the documented TickTick Open API endpoints and Bearer token", async (
   await adapter.createTask({
     projectId: "project-1",
     title: "Задача",
+    content: "Источник: Google Sheets",
     priority: 5,
   });
   await adapter.updateTask({
@@ -141,6 +143,10 @@ test("uses the documented TickTick Open API endpoints and Bearer token", async (
   assert.match(calls[0].url, /\/open\/v1\/project$/);
   assert.match(calls[1].url, /\/open\/v1\/task$/);
   assert.equal(calls[1].method, "POST");
+  assert.equal(
+    (calls[1].body as { content?: string }).content,
+    "Источник: Google Sheets",
+  );
   assert.match(calls[2].url, /\/open\/v1\/task\/task-1$/);
   assert.match(
     calls[3].url,
@@ -229,6 +235,107 @@ test("does not create a duplicate task in the selected list", async () => {
   assert.equal(result?.status, "succeeded");
   assert.match(result?.message || "", /Дубль не создан/);
   assert.equal(createCalls, 0);
+});
+
+test("links a task to a sheet row and prevents an entity duplicate", async () => {
+  let createInput:
+    | Parameters<TickTickAdapter["createTask"]>[0]
+    | undefined;
+  const sourceEntity = {
+    type: "google_sheet_row" as const,
+    spreadsheetId: "sheet-1",
+    spreadsheetTitle: "Запуск магазина ИИ-агентов — 90 дней",
+    sheetName: "ОФФЕРЫ И РАССЫЛКИ",
+    rowNumber: 11,
+    entityId: "partner-row",
+    entityLabel: "Маркетологи / партнёры",
+  };
+  const first = await executeTickTickAction(
+    {
+      id: "action-1",
+      type: "create_task",
+      payload: {
+        title: "Сделать follow-up",
+        project: "Работа",
+        sourceEntity,
+      },
+    },
+    fakeAdapter({
+      createTask: async (input) => {
+        createInput = input;
+        return task({ title: input.title, content: input.content });
+      },
+    }),
+  );
+
+  assert.equal(first?.status, "succeeded");
+  assert.match(createInput?.content ?? "", /строка 11/u);
+  assert.match(createInput?.content ?? "", /ai-team-os:google-sheet-row/u);
+  assert.match(first?.message ?? "", /Связал её с исходной строкой/u);
+
+  let duplicateCreateCalls = 0;
+  const duplicate = await executeTickTickAction(
+    {
+      id: "action-2",
+      type: "create_task",
+      payload: {
+        title: "Написать партнёрам повторно",
+        project: "Работа",
+        sourceEntity,
+      },
+    },
+    fakeAdapter({
+      projectData: {
+        "project-1": {
+          project: PROJECTS[0],
+          tasks: [
+            task({
+              title: "Другое название",
+              content: createInput?.content,
+            }),
+          ],
+        },
+        "project-2": { project: PROJECTS[1], tasks: [] },
+      },
+      createTask: async (input) => {
+        duplicateCreateCalls += 1;
+        return task({ title: input.title });
+      },
+    }),
+  );
+
+  assert.equal(duplicate?.status, "succeeded");
+  assert.match(duplicate?.message ?? "", /Дубль не создан/u);
+  assert.equal(duplicateCreateCalls, 0);
+
+  let distinctCreateCalls = 0;
+  const distinct = await executeTickTickAction(
+    {
+      id: "action-3",
+      type: "create_task",
+      payload: {
+        title: "Подготовить отчёт по сегменту",
+        project: "Работа",
+        sourceEntity,
+      },
+    },
+    fakeAdapter({
+      projectData: {
+        "project-1": {
+          project: PROJECTS[0],
+          tasks: [task({ content: createInput?.content })],
+        },
+        "project-2": { project: PROJECTS[1], tasks: [] },
+      },
+      createTask: async (input) => {
+        distinctCreateCalls += 1;
+        return task({ title: input.title, content: input.content });
+      },
+    }),
+  );
+
+  assert.equal(distinct?.status, "succeeded");
+  assert.equal(distinctCreateCalls, 1);
 });
 
 test("asks for a project when context is still ambiguous", async () => {
@@ -437,6 +544,11 @@ test("rejects mass process tasks and unclear deadlines", async () => {
     "Europe/Moscow",
     new Date("2026-07-30T12:00:00Z"),
   );
+  const relativeDate = resolveTaskDueDate(
+    "через 3 дня",
+    "Europe/Moscow",
+    new Date("2026-07-30T12:00:00Z"),
+  );
 
   assert.equal(massResult?.status, "needs_clarification");
   assert.equal(
@@ -444,6 +556,11 @@ test("rejects mass process tasks and unclear deadlines", async () => {
     "task_concrete_result_required",
   );
   assert.equal(dateResult.kind, "invalid");
+  assert.deepEqual(relativeDate, {
+    kind: "resolved",
+    dueDate: "2026-08-02T00:00:00+0000",
+    timeZone: "Europe/Moscow",
+  });
 });
 
 test(

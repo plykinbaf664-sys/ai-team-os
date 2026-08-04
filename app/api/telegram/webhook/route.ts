@@ -1,4 +1,8 @@
 import { routeRootAgentMessage } from "@/lib/agents/agent-router";
+import {
+  loadAssistantProjectContext,
+  type AssistantProjectContext,
+} from "@/lib/agents/assistant/project-context";
 import { createPersistenceFromEnv } from "@/lib/database/persistence";
 import type { TelegramPersistenceContext } from "@/lib/database/types";
 import { transcribeAudio } from "@/lib/integrations/openai/transcription";
@@ -135,6 +139,16 @@ export async function POST(request: Request) {
             agentRequest.replyToText,
           )
         : undefined;
+    const projectContext =
+      agentRequest.role === "assistant"
+        ? await safelyLoadAssistantProjectContext({
+            persistence,
+            telegramUserId: message.from.id,
+            telegramChatId: message.chat.id,
+            sourceText: agentRequest.text,
+            conversation: conversation ?? [],
+          })
+        : undefined;
     const result = await routeRootAgentMessage({
       role: agentRequest.role,
       text:
@@ -145,6 +159,14 @@ export async function POST(request: Request) {
             )
           : agentRequest.text,
       conversation,
+      assistantContext:
+        agentRequest.role === "assistant"
+          ? {
+              telegramUserId: message.from.id,
+              telegramChatId: message.chat.id,
+              projectContext,
+            }
+          : undefined,
     });
 
     if (!result.persistence) {
@@ -312,18 +334,31 @@ async function handleAssistantVoice({
       return Response.json({ ok: true, ignored: "no_agent_command" });
     }
 
+    const conversation = appendReplyContext(
+      await loadAssistantConversation(
+        persistence,
+        chatId,
+      ),
+      replyContext?.role === "assistant"
+        ? replyContext.text
+        : undefined,
+    );
+    const projectContext = await safelyLoadAssistantProjectContext({
+      persistence,
+      telegramUserId: persistenceContext.userId,
+      telegramChatId: chatId,
+      sourceText: assistantText,
+      conversation,
+    });
     const result = await routeRootAgentMessage({
       role: "assistant",
       text: assistantText,
-      conversation: appendReplyContext(
-        await loadAssistantConversation(
-          persistence,
-          chatId,
-        ),
-        replyContext?.role === "assistant"
-          ? replyContext.text
-          : undefined,
-      ),
+      conversation,
+      assistantContext: {
+        telegramUserId: persistenceContext.userId,
+        telegramChatId: chatId,
+        projectContext,
+      },
     });
 
     if (!result.persistence) {
@@ -470,4 +505,34 @@ function formatProjectReplyText(replyToText: string, userText: string) {
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message.slice(0, 2_000) : "Unknown error";
+}
+
+async function safelyLoadAssistantProjectContext({
+  persistence,
+  telegramUserId,
+  telegramChatId,
+  sourceText,
+  conversation,
+}: {
+  persistence: ReturnType<typeof createPersistenceFromEnv>;
+  telegramUserId: number;
+  telegramChatId: number;
+  sourceText: string;
+  conversation: Awaited<ReturnType<typeof loadAssistantConversation>>;
+}): Promise<AssistantProjectContext | undefined> {
+  try {
+    return await loadAssistantProjectContext({
+      store: persistence,
+      telegramUserId,
+      telegramChatId,
+      sourceText,
+      conversation,
+    });
+  } catch (error) {
+    console.error(
+      "Assistant project context load failed",
+      error instanceof Error ? error.message : "unknown error",
+    );
+    return undefined;
+  }
 }

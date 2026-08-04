@@ -21,6 +21,7 @@ export type PersistenceAgentRun = {
 export type PersistenceAction = {
   externalActionId: string;
   actionType: string;
+  projectId?: string;
   payload: JsonObject;
   status:
     | "planned"

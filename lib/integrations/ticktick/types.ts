@@ -27,6 +27,7 @@ export type TickTickProjectData = {
 export type TickTickCreateTaskInput = {
   projectId: string;
   title: string;
+  content?: string;
   dueDate?: string;
   timeZone?: string;
   isAllDay?: boolean;

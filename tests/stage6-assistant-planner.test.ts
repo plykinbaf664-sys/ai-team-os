@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  enforceAssistantSafety,
+  executeActionPlan,
+  resolveConfirmedRequest,
+} from "../lib/agents/assistant/assistant-core";
 import { planAssistantMessage } from "../lib/agents/assistant/assistant-planner";
 import { requestStructuredResponse } from "../lib/integrations/openai/structured-response";
 
@@ -206,6 +211,310 @@ test("routes TickTick task viewing to list_tasks instead of a capability respons
       payload: { limit: 20 },
     },
   ]);
+});
+
+test("does not accept mock add_metrics as a completed external action", async () => {
+  const sourceText =
+    "Нужно внести, что 30 июля я сделал 10 рассылок по партнерскому сегменту.";
+  let instructions = "";
+  const outcome = await planAssistantMessage(sourceText, {
+    apiKey: "test-key",
+    fetchImplementation: (async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        instructions?: string;
+      };
+      instructions = body.instructions ?? "";
+
+      return openAIResponse({
+        outcome: {
+          kind: "ready",
+          mode: "quick_command",
+          actions: [
+            {
+              id: "action-1",
+              type: "add_metrics",
+              payload: {
+                ...EMPTY_PAYLOAD,
+                metrics: [
+                  {
+                    name: "Рассылки — партнерский сегмент",
+                    value: 10,
+                    period: "2026-07-30",
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      });
+    }) as typeof fetch,
+  });
+
+  assert.match(instructions, /update_sheet/);
+  assert.deepEqual(outcome, {
+    kind: "clarification",
+    question:
+      "В какую таблицу и лист записать эти данные? Если структура ещё не обсуждалась, также пришлите названия колонок.",
+    missingField: "sheet.target,sheet.range,sheet.columns",
+  });
+});
+
+test("uses runtime document structure to plan a real metric write", async () => {
+  const sourceText =
+    "Внеси, что 30 июля я сделал 10 рассылок по партнерскому сегменту.";
+  const documentContext = [
+    "Документ: Запуск магазина и агентов",
+    "spreadsheet_id: launch-sheet",
+    "Лист: Рассылки",
+    "1: Дата | Сегмент | Количество | Комментарий",
+  ].join("\n");
+  let plannerInput = "";
+  const outcome = await planAssistantMessage(sourceText, {
+    apiKey: "test-key",
+    googleSheetsContext: documentContext,
+    fetchImplementation: (async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        input?: string;
+      };
+      plannerInput = body.input ?? "";
+
+      return openAIResponse({
+        outcome: {
+          kind: "ready",
+          mode: "quick_command",
+          actions: [
+            {
+              id: "action-1",
+              type: "update_sheet",
+              payload: {
+                ...EMPTY_PAYLOAD,
+                target: {
+                  kind: "id",
+                  spreadsheetId: "launch-sheet",
+                  title: null,
+                },
+                range: "Рассылки!A:D",
+                operation: "append_rows",
+                values: [
+                  ["30.07.2026", "Партнерский", 10, ""],
+                ],
+              },
+            },
+          ],
+        },
+      });
+    }) as typeof fetch,
+  });
+
+  assert.match(plannerInput, /Запуск магазина и агентов/);
+  assert.equal(outcome?.kind, "ready");
+
+  if (outcome?.kind !== "ready") {
+    assert.fail("Expected a ready write plan.");
+  }
+
+  assert.deepEqual(outcome.plan.actions[0], {
+    id: "action-1",
+    type: "update_sheet",
+    payload: {
+      target: {
+        kind: "id",
+        spreadsheetId: "launch-sheet",
+      },
+      range: "'Рассылки'!A:D",
+      operation: "append_rows",
+      values: [["30.07.2026", "Партнерский", 10, ""]],
+    },
+  });
+});
+
+test("never reports an unsupported metrics action as succeeded", async () => {
+  const results = await executeActionPlan({
+    version: 1,
+    mode: "quick_command",
+    sourceText: "Внести 10 рассылок за 30 июля.",
+    actions: [
+      {
+        id: "action-1",
+        type: "add_metrics",
+        payload: {
+          metrics: [
+            {
+              name: "Рассылки — партнерский сегмент",
+              value: 10,
+              period: "2026-07-30",
+            },
+          ],
+        },
+      },
+    ],
+  });
+
+  assert.equal(results[0].status, "needs_clarification");
+  assert.equal(results[0].errorCode, "metrics_destination_required");
+  assert.doesNotMatch(results[0].message, /mock/iu);
+});
+
+test("executes one appended row without confirmation", () => {
+  const ready = {
+    kind: "ready" as const,
+    plan: {
+      version: 1 as const,
+      mode: "quick_command" as const,
+      sourceText: "Внеси 10 рассылок за 30 июля.",
+      actions: [
+        {
+          id: "action-1",
+          type: "update_sheet" as const,
+          payload: {
+            target: {
+              kind: "id" as const,
+              spreadsheetId: "launch",
+            },
+            range: "'СЕГМЕНТЫ КОНТАКТОВ'!A:J",
+            operation: "append_rows" as const,
+            values: [
+              [
+                "2026-07-30",
+                "Рассылка",
+                "Партнёры / Консалтинг",
+                10,
+                null,
+                "отправлено",
+                10,
+                null,
+                null,
+                "",
+              ],
+            ],
+          },
+        },
+      ],
+    },
+  };
+
+  assert.equal(
+    enforceAssistantSafety(ready.plan.sourceText, ready).kind,
+    "ready",
+  );
+});
+
+test("still requires confirmation for bulk sheet writes", () => {
+  const outcome = enforceAssistantSafety("Добавь эти строки", {
+    kind: "ready",
+    plan: {
+      version: 1,
+      mode: "batch_report",
+      sourceText: "Добавь эти строки",
+      actions: [
+        {
+          id: "action-1",
+          type: "update_sheet",
+          payload: {
+            target: {
+              kind: "id",
+              spreadsheetId: "launch",
+            },
+            range: "'Лог'!A:J",
+            operation: "append_rows",
+            values: Array.from({ length: 6 }, (_, index) => [
+              `row-${index + 1}`,
+            ]),
+          },
+        },
+      ],
+    },
+  });
+
+  assert.equal(outcome.kind, "confirmation");
+});
+
+test("restores only the immediately confirmed request", () => {
+  const conversation = [
+    {
+      role: "user" as const,
+      text: "Очисти старый диапазон.",
+    },
+    {
+      role: "assistant" as const,
+      text: "Перед выполнением нужно твоё подтверждение.\nОчистить диапазон.",
+    },
+    {
+      role: "user" as const,
+      text: "Подтверждаю",
+    },
+    {
+      role: "assistant" as const,
+      text: "Требуется подтверждение\n\nПодтверждаю",
+    },
+    {
+      role: "user" as const,
+      text: "Ассистент, я подтверждаю.",
+    },
+    {
+      role: "assistant" as const,
+      text: "Требуется подтверждение\n\nя подтверждаю.",
+    },
+  ];
+
+  assert.equal(
+    resolveConfirmedRequest("Ассистент, я подтверждаю.", conversation),
+    "Очисти старый диапазон.",
+  );
+  assert.equal(
+    resolveConfirmedRequest("Что именно?", conversation),
+    null,
+  );
+  assert.equal(
+    resolveConfirmedRequest("Подтверждаю", [
+      ...conversation,
+      {
+        role: "assistant",
+        text: "Вот обычный ответ без подтверждения.",
+      },
+    ]),
+    null,
+  );
+});
+
+test("tells the planner when the previous operation was confirmed", async () => {
+  let plannerInput = "";
+  const outcome = await planAssistantMessage("Очисти диапазон", {
+    apiKey: "test-key",
+    confirmationGranted: true,
+    fetchImplementation: (async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        input?: string;
+      };
+      plannerInput = body.input ?? "";
+
+      return openAIResponse({
+        outcome: {
+          kind: "ready",
+          mode: "quick_command",
+          actions: [
+            {
+              id: "action-1",
+              type: "update_sheet",
+              payload: {
+                ...EMPTY_PAYLOAD,
+                target: {
+                  kind: "id",
+                  spreadsheetId: "launch",
+                  title: null,
+                },
+                range: "'Архив'!A2:J20",
+                operation: "clear_range",
+              },
+            },
+          ],
+        },
+      });
+    }) as typeof fetch,
+  });
+
+  assert.match(plannerInput, /явно подтвердил/);
+  assert.equal(outcome?.kind, "ready");
 });
 
 test("passes recent conversation and exact TickTick projects to the planner", async () => {

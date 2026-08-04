@@ -14,8 +14,33 @@ import type {
 } from "./types";
 import { executeGoogleSheetsAction } from "@/lib/executors/google-sheets-executor";
 import { executeTickTickAction } from "@/lib/executors/ticktick-executor";
+import { executeGoogleCalendarAction } from "@/lib/executors/google-calendar-executor";
 import { createTickTickAdapterFromEnv } from "@/lib/integrations/ticktick/ticktick-adapter";
+import {
+  formatGoogleSheetsWorkspaceContext,
+  inspectGoogleSheetsWorkspace,
+  type GoogleSheetsWorkspaceContext,
+} from "@/lib/integrations/google-sheets/document-context";
+import { createGoogleSheetsAdapterFromEnv } from "@/lib/integrations/google-sheets/google-sheets-adapter";
 import { planAssistantMessage } from "./assistant-planner";
+import type { AssistantProjectContext } from "./project-context";
+import {
+  attachStrategicPlan,
+  reconcileStrategicPlanWithSheets,
+  validateStrategicActionPlan,
+} from "./strategic-planner";
+import {
+  createPolicyBlockedResults,
+  evaluateActionPlanPolicy,
+  filterExecutableActionPlan,
+} from "./confidence-policy";
+import { composeStrategicResponse } from "./strategic-response-composer";
+import { coordinateTickTickPlan } from "./ticktick-coordination";
+import {
+  attachProactiveMonitoring,
+  type TickTickMonitoringContext,
+} from "./proactive-monitor";
+import type { TickTickProject } from "@/lib/integrations/ticktick/types";
 
 const ASSISTANT_MODES: AssistantMode[] = [
   "quick_command",
@@ -53,26 +78,40 @@ export type AssistantPipelineResult = {
   outcome: AssistantPlanOutcome;
   results: ActionResult[];
   text: string;
+  projectContext?: AssistantProjectContext;
 };
 
 export async function runAssistantPipeline(
   sourceText: string,
   {
     conversation = [],
+    projectContext,
   }: {
     conversation?: AssistantConversationMessage[];
+    projectContext?: AssistantProjectContext;
   } = {},
 ): Promise<AssistantPipelineResult> {
-  const outcome = enforceAssistantSafety(
+  const confirmedSourceText = resolveConfirmedRequest(
     sourceText,
-    await createAssistantPlan(sourceText, { conversation }),
+    conversation,
   );
+  const planningSourceText = confirmedSourceText ?? sourceText;
+  const plannedOutcome = await createAssistantPlan(planningSourceText, {
+    conversation,
+    confirmationGranted: confirmedSourceText !== null,
+    projectContext,
+  });
+  const outcome =
+    confirmedSourceText !== null
+      ? plannedOutcome
+      : enforceAssistantSafety(sourceText, plannedOutcome);
 
   if (outcome.kind === "response") {
     return {
       outcome,
       results: [],
       text: outcome.text,
+      projectContext,
     };
   }
 
@@ -80,7 +119,8 @@ export async function runAssistantPipeline(
     return {
       outcome,
       results: [],
-      text: ["Уточнение", "", outcome.question].join("\n"),
+      text: outcome.question,
+      projectContext,
     };
   }
 
@@ -89,12 +129,12 @@ export async function runAssistantPipeline(
       outcome,
       results: [],
       text: [
-        "Требуется подтверждение",
-        "",
+        "Перед выполнением нужно твоё подтверждение.",
         outcome.operationSummary,
         outcome.reason,
         outcome.prompt,
       ].join("\n"),
+      projectContext,
     };
   }
 
@@ -109,15 +149,42 @@ export async function runAssistantPipeline(
         "",
         validation.errors.join("; "),
       ].join("\n"),
+      projectContext,
     };
   }
 
-  const results = await executeActionPlan(validation.plan);
+  const policy = evaluateActionPlanPolicy(
+    validation.plan,
+    projectContext,
+  );
+  const executablePlan = filterExecutableActionPlan(
+    validation.plan,
+    policy,
+  );
+  const executedResults = executablePlan
+    ? await executeActionPlan(executablePlan)
+    : [];
+  const blockedResults = createPolicyBlockedResults(
+    validation.plan,
+    policy,
+  );
+  const results = validation.plan.actions.flatMap((action) => {
+    const result = [...executedResults, ...blockedResults].find(
+      (candidate) => candidate.actionId === action.id,
+    );
+    return result ? [result] : [];
+  });
+  const resultText = composeStrategicResponse(
+    validation.plan,
+    results,
+    policy.clarificationQuestions,
+  );
 
   return {
     outcome,
     results,
-    text: formatResults(validation.plan, results),
+    text: resultText,
+    projectContext,
   };
 }
 
@@ -125,41 +192,226 @@ export async function createAssistantPlan(
   sourceText: string,
   {
     conversation = [],
+    confirmationGranted = false,
+    projectContext,
   }: {
     conversation?: AssistantConversationMessage[];
+    confirmationGranted?: boolean;
+    projectContext?: AssistantProjectContext;
   } = {},
 ): Promise<AssistantPlanOutcome> {
   try {
-    const tickTickProjectNames = await getTickTickProjectNames();
+    const [tickTickProjectNames, googleSheetsContext] =
+      await Promise.all([
+        getTickTickProjectNames(),
+        getGoogleSheetsContext(sourceText, conversation, projectContext),
+      ]);
 
-    return (
+    const outcome =
       (await planAssistantMessage(sourceText, {
         conversation,
         tickTickProjectNames,
+        googleSheetsContext: googleSheetsContext.text,
+        confirmationGranted,
+        projectContext,
       })) ??
-      createMockActionPlan(sourceText)
+      createMockActionPlan(sourceText);
+
+    const reconciled = reconcileStrategicPlanWithSheets(
+      outcome,
+      sourceText,
+      googleSheetsContext.workspace,
     );
+
+    if (reconciled.kind !== "ready") return reconciled;
+    const strategicPlan = attachStrategicPlan(
+      reconciled.plan,
+      projectContext,
+    );
+
+    const coordinatedPlan = coordinateTickTickPlan(strategicPlan, {
+      sourceText,
+      conversation,
+      projectContext,
+      tickTickProjectNames,
+    });
+    const tickTickMonitoring = googleSheetsContext.workspace
+      ? await getTickTickMonitoringContext()
+      : { available: false, tasks: [] };
+
+    return {
+      ...reconciled,
+      plan: attachProactiveMonitoring(coordinatedPlan, {
+        workspace: googleSheetsContext.workspace,
+        tickTick: tickTickMonitoring,
+        projectContext,
+        conversation,
+      }),
+    };
   } catch (error) {
     console.error(
       "Assistant planner failed; using deterministic fallback:",
       error instanceof Error ? error.message : "unknown error",
     );
-    return createMockActionPlan(sourceText);
+    const fallback = createMockActionPlan(sourceText);
+    if (fallback.kind !== "ready") return fallback;
+    const strategicPlan = attachStrategicPlan(
+      fallback.plan,
+      projectContext,
+    );
+
+    return {
+      ...fallback,
+      plan: coordinateTickTickPlan(strategicPlan, {
+        sourceText,
+        conversation,
+        projectContext,
+      }),
+    };
   }
+}
+
+export function resolveConfirmedRequest(
+  sourceText: string,
+  conversation: AssistantConversationMessage[],
+) {
+  if (!isExplicitConfirmationText(sourceText)) {
+    return null;
+  }
+
+  for (let index = conversation.length - 1; index >= 0; index -= 1) {
+    const message = conversation[index];
+
+    if (message.role !== "assistant") {
+      continue;
+    }
+
+    if (
+      !/(?:нужно|требуется)\s+(?:тво[её]\s+)?подтверждени|подтверди\s+(?:операци|действи)/iu.test(
+        message.text,
+      )
+    ) {
+      return null;
+    }
+
+    for (let requestIndex = index - 1; requestIndex >= 0; requestIndex -= 1) {
+      const request = conversation[requestIndex];
+
+      if (
+        request.role === "user" &&
+        request.text.trim() &&
+        !isExplicitConfirmationText(request.text)
+      ) {
+        return request.text.trim();
+      }
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+function isExplicitConfirmationText(value: string) {
+  const normalized = value
+    .trim()
+    .replace(
+      /^(?:ассистент|assistant)(?:@\w+)?[\s,.:;—-]+/iu,
+      "",
+    );
+
+  return /^(?:я\s+)?(?:подтверждаю|подтверждено|выполняй|применяй|да[\s,.:;-]*(?:подтверждаю|выполняй|делай|применяй))[\s.!]*$/iu.test(
+    normalized,
+  );
+}
+
+async function getGoogleSheetsContext(
+  sourceText: string,
+  conversation: AssistantConversationMessage[],
+  projectContext?: AssistantProjectContext,
+): Promise<{
+  text: string;
+  workspace?: GoogleSheetsWorkspaceContext;
+}> {
+  if (!shouldInspectGoogleSheets(sourceText, conversation)) {
+    return { text: "" };
+  }
+
+  const adapter = createGoogleSheetsAdapterFromEnv();
+
+  if (!adapter) {
+    return { text: "" };
+  }
+
+  try {
+    const workspace = await inspectGoogleSheetsWorkspace({
+      adapter,
+      sourceText: [
+        sourceText,
+        ...(projectContext?.activeProject?.resources ?? [])
+          .filter(
+            (resource) => resource.resourceType === "google_sheet",
+          )
+          .map((resource) => resource.title),
+      ].join("\n"),
+      conversation,
+    });
+    return {
+      text: formatGoogleSheetsWorkspaceContext(workspace),
+      workspace,
+    };
+  } catch (error) {
+    console.error(
+      "Google Sheets document context load failed:",
+      error instanceof Error ? error.message : "unknown error",
+    );
+    return { text: "" };
+  }
+}
+
+export function shouldInspectGoogleSheets(
+  sourceText: string,
+  conversation: AssistantConversationMessage[],
+) {
+  const context = [
+    sourceText,
+    ...conversation.slice(-6).map((message) => message.text),
+  ].join("\n");
+  const mentionsSheets =
+    /таблиц|лист[аеуы]?|google\s*sheets?|spreadsheet|ячейк/iu.test(
+      context,
+    );
+  const writesData =
+    /внес|зафикс|запиш|добав|обнов|измени|отмет|сделал|сделала|отправил|отправила|пров[её]л|провела|получил|получила/iu.test(
+      sourceText,
+    ) &&
+    /данн|показател|метрик|результат|факт|рассыл|лид|продаж|выруч|расход|сегмент|созвон|интервью|\d/iu.test(
+      sourceText,
+    );
+  const requestsOperationalReview =
+    /что.*(?:требует внимания|зависло|просрочено)|где.*(?:отставание|расхождение)|следующ(?:ее|ий)\s+действие|проверь.*(?:статус|план.?факт|follow.?up)/iu.test(
+      sourceText,
+    );
+
+  return mentionsSheets || writesData || requestsOperationalReview;
 }
 
 let tickTickProjectCache:
   | {
       expiresAt: number;
-      names: string[];
+      projects: TickTickProject[];
     }
   | undefined;
 
 async function getTickTickProjectNames() {
+  return (await getWritableTickTickProjects()).map((project) => project.name);
+}
+
+async function getWritableTickTickProjects() {
   const now = Date.now();
 
   if (tickTickProjectCache && tickTickProjectCache.expiresAt > now) {
-    return tickTickProjectCache.names;
+    return tickTickProjectCache.projects;
   }
 
   const adapter = createTickTickAdapterFromEnv();
@@ -169,28 +421,80 @@ async function getTickTickProjectNames() {
   }
 
   try {
-    const names = (await adapter.listProjects())
+    const projects = (await adapter.listProjects())
       .filter(
         (project) =>
           !project.closed &&
           project.permission !== "read" &&
           project.permission !== "comment",
-      )
-      .map((project) => project.name.trim())
-      .filter(Boolean);
+      );
 
     tickTickProjectCache = {
-      names,
+      projects,
       expiresAt: now + 5 * 60 * 1_000,
     };
 
-    return names;
+    return projects;
   } catch (error) {
     console.error(
       "TickTick project context load failed:",
       error instanceof Error ? error.message : "unknown error",
     );
     return [];
+  }
+}
+
+let tickTickMonitoringCache:
+  | {
+      expiresAt: number;
+      context: TickTickMonitoringContext;
+    }
+  | undefined;
+
+async function getTickTickMonitoringContext(): Promise<TickTickMonitoringContext> {
+  const now = Date.now();
+
+  if (tickTickMonitoringCache && tickTickMonitoringCache.expiresAt > now) {
+    return tickTickMonitoringCache.context;
+  }
+
+  const adapter = createTickTickAdapterFromEnv();
+  if (!adapter) return { available: false, tasks: [] };
+
+  try {
+    const projects = await getWritableTickTickProjects();
+    const projectData = await Promise.all(
+      projects.map((project) => adapter.getProjectData(project.id)),
+    );
+    const context: TickTickMonitoringContext = {
+      available: true,
+      tasks: projectData
+        .flatMap((data) =>
+          data.tasks
+            .filter((task) => task.status === 0)
+            .map((task) => ({
+              id: task.id,
+              projectId: task.projectId,
+              projectName: data.project.name,
+              title: task.title,
+              ...(task.content ? { content: task.content } : {}),
+              ...(task.dueDate ? { dueDate: task.dueDate } : {}),
+            })),
+        )
+        .slice(0, 200),
+    };
+
+    tickTickMonitoringCache = {
+      context,
+      expiresAt: now + 5 * 60 * 1_000,
+    };
+    return context;
+  } catch (error) {
+    console.error(
+      "TickTick monitoring context load failed:",
+      error instanceof Error ? error.message : "unknown error",
+    );
+    return { available: false, tasks: [] };
   }
 }
 
@@ -301,23 +605,19 @@ export function validateActionPlan(value: unknown): ActionPlanValidation {
     value.actions.forEach((action, index) => validateAction(action, index, errors));
   }
 
+  if (value.strategicPlan !== undefined) {
+    errors.push(...validateStrategicActionPlan(value.strategicPlan));
+  }
+
+  if (value.monitoringReport !== undefined) {
+    errors.push(...validateMonitoringReport(value.monitoringReport));
+  }
+
   if (errors.length) {
     return { valid: false, errors };
   }
 
   return { valid: true, plan: value as ActionPlan };
-}
-
-export function executeMockActionPlan(plan: ActionPlan): ActionResult[] {
-  return plan.actions.map((action) => ({
-    actionId: action.id,
-    actionType: action.type,
-    status: "succeeded",
-    message:
-      action.type === "create_task"
-        ? `Mock-задача подготовлена: ${action.payload.title}`
-        : `Mock-действие ${action.type} подготовлено.`,
-  }));
 }
 
 export async function executeActionPlan(plan: ActionPlan) {
@@ -329,18 +629,44 @@ export async function executeActionPlan(plan: ActionPlan) {
       googleSheetsResult === null
         ? await executeTickTickAction(action)
         : null;
+    const calendarResult =
+      googleSheetsResult === null && tickTickResult === null
+        ? await executeGoogleCalendarAction(action)
+        : null;
 
     results.push(
       googleSheetsResult ??
         tickTickResult ??
-        executeMockActionPlan({
-          ...plan,
-          actions: [action],
-        })[0],
+        calendarResult ??
+        unsupportedActionResult(action),
     );
   }
 
   return results;
+}
+
+function unsupportedActionResult(action: AssistantAction): ActionResult {
+  if (
+    action.type === "add_metrics" ||
+    action.type === "update_metrics"
+  ) {
+    return {
+      actionId: action.id,
+      actionType: action.type,
+      status: "needs_clarification",
+      message:
+        "В какую таблицу и лист записать эти данные? Если структура ещё не обсуждалась, также пришлите названия колонок.",
+      errorCode: "metrics_destination_required",
+    };
+  }
+
+  return {
+    actionId: action.id,
+    actionType: action.type,
+    status: "failed",
+    message: `Действие ${action.type} пока не подключено к реальному исполнителю.`,
+    errorCode: "action_not_implemented",
+  };
 }
 
 function isOwnProjectTrackerRequest(text: string) {
@@ -644,11 +970,14 @@ function hasDangerousPlannedAction(actions: AssistantAction[]) {
       return false;
     }
 
-    return (
-      action.payload.operation === "clear_range" ||
-      action.payload.range.includes(":") ||
-      (action.payload.values?.flat().length ?? 0) > 20
-    );
+    if (action.payload.operation === "clear_range") {
+      return true;
+    }
+
+    const rowCount = action.payload.values?.length ?? 0;
+    const cellCount = action.payload.values?.flat().length ?? 0;
+
+    return rowCount > 5 || cellCount > 50;
   });
 }
 
@@ -706,6 +1035,12 @@ function validatePayload(
       if (payload.priority !== undefined && !isTaskPriority(payload.priority)) {
         errors.push(`${path}.payload.priority is invalid`);
       }
+      if (
+        payload.sourceEntity !== undefined &&
+        !isTaskSourceEntity(payload.sourceEntity)
+      ) {
+        errors.push(`${path}.payload.sourceEntity is invalid`);
+      }
       break;
     case "update_task":
       requireSelector(payload, "taskId", "taskTitle", path, errors);
@@ -728,11 +1063,38 @@ function validatePayload(
       break;
     case "create_calendar_event":
       requireStrings(payload, ["title", "date", "startTime"], path, errors);
+      if (isNonEmptyString(payload.date) && !isIsoDate(payload.date)) {
+        errors.push(`${path}.payload.date is invalid`);
+      }
+      if (isNonEmptyString(payload.startTime) && !isClockTime(payload.startTime)) {
+        errors.push(`${path}.payload.startTime is invalid`);
+      }
+      if (payload.endTime !== undefined && !isClockTime(payload.endTime)) {
+        errors.push(`${path}.payload.endTime is invalid`);
+      }
+      if (payload.timezone !== undefined && !isTimezone(payload.timezone)) {
+        errors.push(`${path}.payload.timezone is invalid`);
+      }
       break;
     case "update_calendar_event":
       requireSelector(payload, "eventId", "eventTitle", path, errors);
       if (!isObject(payload.changes) || !Object.keys(payload.changes).length) {
         errors.push(`${path}.payload.changes is required`);
+      } else {
+        if (payload.changes.date !== undefined && !isIsoDate(payload.changes.date)) {
+          errors.push(`${path}.payload.changes.date is invalid`);
+        }
+        for (const key of ["startTime", "endTime"] as const) {
+          if (payload.changes[key] !== undefined && !isClockTime(payload.changes[key])) {
+            errors.push(`${path}.payload.changes.${key} is invalid`);
+          }
+        }
+        if (
+          payload.changes.timezone !== undefined &&
+          !isTimezone(payload.changes.timezone)
+        ) {
+          errors.push(`${path}.payload.changes.timezone is invalid`);
+        }
       }
       break;
     case "create_sheet":
@@ -756,6 +1118,23 @@ function validatePayload(
     case "update_sheet":
       validateExistingSheetTarget(payload.target, path, errors);
       requireStrings(payload, ["range"], path, errors);
+      if (
+        isNonEmptyString(payload.range) &&
+        !payload.range.includes("!")
+      ) {
+        errors.push(
+          `${path}.payload.range must include an exact sheet title`,
+        );
+      }
+      if (
+        payload.operation === "append_rows" &&
+        isNonEmptyString(payload.range) &&
+        /\d/.test(payload.range.split("!").at(-1) ?? "")
+      ) {
+        errors.push(
+          `${path}.payload.range for append_rows must not contain row numbers`,
+        );
+      }
       if (
         payload.operation !== "append_rows" &&
         payload.operation !== "update_cells" &&
@@ -880,6 +1259,21 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(isNonEmptyString);
 }
 
+function isTaskSourceEntity(value: unknown) {
+  return (
+    isObject(value) &&
+    value.type === "google_sheet_row" &&
+    isNonEmptyString(value.spreadsheetId) &&
+    isNonEmptyString(value.sheetName) &&
+    Number.isInteger(value.rowNumber) &&
+    (value.rowNumber as number) > 0 &&
+    isNonEmptyString(value.entityId) &&
+    (value.spreadsheetTitle === undefined ||
+      isNonEmptyString(value.spreadsheetTitle)) &&
+    (value.entityLabel === undefined || isNonEmptyString(value.entityLabel))
+  );
+}
+
 function isAssistantMode(value: unknown): value is AssistantMode {
   return (
     typeof value === "string" &&
@@ -903,49 +1297,92 @@ function isTaskPriority(value: unknown): value is TaskPriority {
   );
 }
 
+function isIsoDate(value: unknown) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) {
+    return false;
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function isClockTime(value: unknown) {
+  return typeof value === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/u.test(value);
+}
+
+function isTimezone(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+function validateMonitoringReport(value: unknown) {
+  if (!isObject(value)) return ["monitoringReport must be an object"];
+  const errors: string[] = [];
 
-function formatResults(plan: ActionPlan, results: ActionResult[]) {
-  const task = plan.actions[0];
-  const containsOnlyImplementedActions = plan.actions.every(
-    (action) =>
-      action.type === "create_sheet" ||
-      action.type === "create_sheet_tab" ||
-      action.type === "find_sheet" ||
-      action.type === "read_sheet" ||
-      action.type === "update_sheet" ||
-      action.type === "create_sheet_blueprint" ||
-      action.type === "create_task" ||
-      action.type === "update_task" ||
-      action.type === "complete_task" ||
-      action.type === "list_tasks",
-  );
-  const dueDateText =
-    task.type === "create_task" && task.payload.dueDateText
-      ? `\nСрок из сообщения: ${task.payload.dueDateText}`
-      : "";
-
-  const heading = containsOnlyImplementedActions
-    ? results.every((result) => result.status === "succeeded")
-      ? "Готово"
-      : "Результат"
-    : "Предварительный результат";
-  const lines = [
-    heading,
-    "",
-    results.map((result) => result.message).join("\n"),
-    dueDateText,
-  ];
-
-  if (!containsOnlyImplementedActions) {
-    lines.push("", "Реальное внешнее действие не выполнялось.");
+  if (value.version !== 1) errors.push("monitoringReport.version must be 1");
+  if (value.scope !== "relevant_context") {
+    errors.push("monitoringReport.scope is invalid");
+  }
+  if (!isNonEmptyString(value.checkedAt)) {
+    errors.push("monitoringReport.checkedAt is required");
+  }
+  if (!Array.isArray(value.findings) || value.findings.length > 8) {
+    errors.push("monitoringReport.findings must contain at most 8 items");
+    return errors;
   }
 
-  return lines.join("\n");
+  const kinds = new Set([
+    "stale_segment",
+    "missed_follow_up",
+    "plan_fact_deviation",
+    "missing_next_action",
+    "inconsistent_data",
+  ]);
+  const severities = new Set(["low", "medium", "high"]);
+
+  value.findings.forEach((finding, index) => {
+    if (!isObject(finding)) {
+      errors.push(`monitoringReport.findings[${index}] must be an object`);
+      return;
+    }
+    const prefix = `monitoringReport.findings[${index}]`;
+    if (!kinds.has(String(finding.kind))) errors.push(`${prefix}.kind is invalid`);
+    if (!severities.has(String(finding.severity))) {
+      errors.push(`${prefix}.severity is invalid`);
+    }
+    for (const key of [
+      "id",
+      "title",
+      "recommendation",
+      "spreadsheetId",
+      "sheetName",
+      "entityId",
+      "entityLabel",
+    ]) {
+      if (!isNonEmptyString(finding[key])) errors.push(`${prefix}.${key} is required`);
+    }
+    if (!Number.isInteger(finding.rowNumber) || Number(finding.rowNumber) < 1) {
+      errors.push(`${prefix}.rowNumber is invalid`);
+    }
+    if (
+      !Array.isArray(finding.evidence) ||
+      finding.evidence.some((item) => !isNonEmptyString(item))
+    ) {
+      errors.push(`${prefix}.evidence is invalid`);
+    }
+  });
+
+  return errors;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

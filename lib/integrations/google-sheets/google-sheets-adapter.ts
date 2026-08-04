@@ -10,6 +10,7 @@ import type {
   SheetCellInput,
   SheetChartBlueprint,
   SheetConditionalFormat,
+  SheetGridMetadata,
   SheetScalar,
 } from "./types";
 
@@ -67,6 +68,44 @@ type BatchUpdateResponse = {
 type ValueRangeResponse = {
   range?: string;
   values?: unknown[][];
+};
+
+type AppendValuesResponse = {
+  updates?: {
+    updatedRange?: string;
+  };
+};
+
+type SpreadsheetGridMetadataResponse = {
+  sheets?: Array<{
+    properties?: {
+      sheetId?: number;
+      title?: string;
+      gridProperties?: {
+        columnCount?: number;
+      };
+    };
+    protectedRanges?: Array<{
+      range?: {
+        sheetId?: number;
+        startRowIndex?: number;
+        endRowIndex?: number;
+        startColumnIndex?: number;
+        endColumnIndex?: number;
+      };
+    }>;
+    data?: Array<{
+      startRow?: number;
+      startColumn?: number;
+      rowData?: Array<{
+        values?: Array<{
+          userEnteredValue?: {
+            formulaValue?: string;
+          };
+        }>;
+      }>;
+    }>;
+  }>;
 };
 
 const SHEETS_API = "https://sheets.googleapis.com/v4";
@@ -141,6 +180,45 @@ export function createGoogleSheetsAdapter({
     );
 
     return result.files?.[0] ?? null;
+  }
+
+  async function listExistingSpreadsheets() {
+    const query = [
+      `mimeType='${SPREADSHEET_MIME_TYPE}'`,
+      "trashed=false",
+    ].join(" and ");
+    const files: DriveFile[] = [];
+    let pageToken: string | undefined;
+
+    do {
+      const parameters = new URLSearchParams({
+        q: query,
+        corpora: "user",
+        spaces: "drive",
+        pageSize: "1000",
+        orderBy: "modifiedTime desc",
+        fields: "nextPageToken,files(id,name,webViewLink,modifiedTime)",
+      });
+
+      if (pageToken) {
+        parameters.set("pageToken", pageToken);
+      }
+
+      const result = await requestJson<DriveListResponse>(
+        `${DRIVE_API}/files?${parameters.toString()}`,
+      );
+
+      files.push(...(result.files ?? []));
+      pageToken = result.nextPageToken;
+    } while (pageToken);
+
+    return files
+      .filter(
+        (file) =>
+          typeof file.id === "string" &&
+          typeof file.name === "string",
+      )
+      .map(toExistingSpreadsheetSummary);
   }
 
   async function updateDriveState(
@@ -247,45 +325,17 @@ export function createGoogleSheetsAdapter({
         throw new Error("Google Sheet title is required.");
       }
 
-      const query = [
-        `mimeType='${SPREADSHEET_MIME_TYPE}'`,
-        "trashed=false",
-      ].join(" and ");
-      const files: DriveFile[] = [];
-      let pageToken: string | undefined;
-
-      do {
-        const parameters = new URLSearchParams({
-          q: query,
-          corpora: "user",
-          spaces: "drive",
-          pageSize: "1000",
-          orderBy: "modifiedTime desc",
-          fields: "nextPageToken,files(id,name,webViewLink,modifiedTime)",
-        });
-
-        if (pageToken) {
-          parameters.set("pageToken", pageToken);
-        }
-
-        const result = await requestJson<DriveListResponse>(
-          `${DRIVE_API}/files?${parameters.toString()}`,
-        );
-
-        files.push(...(result.files ?? []));
-        pageToken = result.nextPageToken;
-      } while (pageToken);
-
-      return files
+      return (await listExistingSpreadsheets())
         .filter(
           (file) =>
-            typeof file.id === "string" &&
-            typeof file.name === "string" &&
-            file.name.localeCompare(normalizedTitle, undefined, {
+            file.title.localeCompare(normalizedTitle, undefined, {
               sensitivity: "base",
             }) === 0,
-        )
-        .map(toExistingSpreadsheetSummary);
+        );
+    },
+
+    async listSpreadsheets() {
+      return listExistingSpreadsheets();
     },
 
     async getSpreadsheetMetadata(spreadsheetId) {
@@ -313,6 +363,39 @@ export function createGoogleSheetsAdapter({
         range: result.range || range,
         values: normalizeSheetValues(result.values),
       };
+    },
+
+    async readSheetGridMetadata({ spreadsheetId, range }) {
+      const spreadsheet = await getSpreadsheet(spreadsheetId);
+      const sheetId = resolveSheetId(spreadsheet, range);
+      const sheet = spreadsheet.sheets?.find(
+        (candidate) => candidate.properties?.sheetId === sheetId,
+      );
+      const parameters = new URLSearchParams({
+        includeGridData: "true",
+        ranges: range,
+        fields: [
+          "sheets(properties(sheetId,title,gridProperties(columnCount))",
+          "protectedRanges(range(sheetId,startRowIndex,endRowIndex,startColumnIndex,endColumnIndex))",
+          "data(startRow,startColumn,rowData(values(userEnteredValue(formulaValue)))))",
+        ].join(","),
+      });
+      const result = await requestJson<SpreadsheetGridMetadataResponse>(
+        `${SHEETS_API}/spreadsheets/${encodeURIComponent(spreadsheetId)}?${parameters.toString()}`,
+      );
+      const resultSheet = result.sheets?.find(
+        (candidate) => candidate.properties?.sheetId === sheetId,
+      );
+
+      return toSheetGridMetadata({
+        spreadsheetId,
+        sheetId,
+        sheetName:
+          resultSheet?.properties?.title ??
+          sheet?.properties?.title ??
+          "",
+        sheet: resultSheet,
+      });
     },
 
     async createSheetTab({ spreadsheetId, title }) {
@@ -359,10 +442,25 @@ export function createGoogleSheetsAdapter({
             metadata.metadataValue === marker,
         )
       ) {
-        return;
+        return { reused: true };
       }
 
-      const sheetId = resolveSheetId(spreadsheet, range);
+      resolveSheetId(spreadsheet, range);
+      const parameters = new URLSearchParams({
+        valueInputOption: "USER_ENTERED",
+        insertDataOption: "INSERT_ROWS",
+      });
+      const appendResult = await requestJson<AppendValuesResponse>(
+        `${SHEETS_API}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}:append?${parameters.toString()}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            range,
+            majorDimension: "ROWS",
+            values,
+          }),
+        },
+      );
 
       await requestJson<BatchUpdateResponse>(
         `${SHEETS_API}/spreadsheets/${encodeURIComponent(spreadsheetId)}:batchUpdate`,
@@ -370,20 +468,16 @@ export function createGoogleSheetsAdapter({
           method: "POST",
           body: JSON.stringify({
             requests: [
-              {
-                appendCells: {
-                  sheetId,
-                  rows: values.map((row) => ({
-                    values: row.map(toScalarCellData),
-                  })),
-                  fields: "userEnteredValue",
-                },
-              },
               createMetadataRequest(ACTION_METADATA_KEY, marker),
             ],
           }),
         },
       );
+
+      return {
+        updatedRange: appendResult.updates?.updatedRange,
+        reused: false,
+      };
     },
 
     async updateCells({ spreadsheetId, range, values }) {
@@ -1039,6 +1133,87 @@ function normalizeSheetValues(values: unknown[][] | undefined): SheetScalar[][] 
       return String(value);
     }),
   );
+}
+
+function toSheetGridMetadata({
+  spreadsheetId,
+  sheetId,
+  sheetName,
+  sheet,
+}: {
+  spreadsheetId: string;
+  sheetId: number;
+  sheetName: string;
+  sheet: NonNullable<SpreadsheetGridMetadataResponse["sheets"]>[number] | undefined;
+}): SheetGridMetadata {
+  const formulaColumns = new Set<number>();
+  const protectedColumns = new Set<number>();
+  const formulaCells: NonNullable<SheetGridMetadata["formulaCells"]> = [];
+  const protectedRanges: NonNullable<SheetGridMetadata["protectedRanges"]> = [];
+
+  for (const data of sheet?.data ?? []) {
+    const startRow = data.startRow ?? 0;
+    const startColumn = data.startColumn ?? 0;
+
+    for (const [rowOffset, row] of (data.rowData ?? []).entries()) {
+      for (const [offset, cell] of (row.values ?? []).entries()) {
+        const formula = cell.userEnteredValue?.formulaValue;
+        if (formula) {
+          const columnIndex = startColumn + offset;
+          formulaColumns.add(columnIndex);
+          formulaCells.push({
+            rowIndex: startRow + rowOffset,
+            columnIndex,
+            formula,
+          });
+        }
+      }
+    }
+  }
+
+  for (const protectedRange of sheet?.protectedRanges ?? []) {
+    const range = protectedRange.range;
+
+    if (range?.sheetId !== undefined && range.sheetId !== sheetId) {
+      continue;
+    }
+
+    const start = range?.startColumnIndex ?? 0;
+    const end =
+      range?.endColumnIndex ??
+      sheet?.properties?.gridProperties?.columnCount ??
+      start + 1;
+
+    for (let index = start; index < end; index += 1) {
+      protectedColumns.add(index);
+    }
+    protectedRanges.push({
+      ...(range?.startRowIndex !== undefined
+        ? { startRowIndex: range.startRowIndex }
+        : {}),
+      ...(range?.endRowIndex !== undefined
+        ? { endRowIndex: range.endRowIndex }
+        : {}),
+      ...(range?.startColumnIndex !== undefined
+        ? { startColumnIndex: range.startColumnIndex }
+        : {}),
+      ...(range?.endColumnIndex !== undefined
+        ? { endColumnIndex: range.endColumnIndex }
+        : {}),
+    });
+  }
+
+  return {
+    spreadsheetId,
+    sheetId,
+    sheetName,
+    formulaColumns: [...formulaColumns].sort((left, right) => left - right),
+    protectedColumns: [...protectedColumns].sort(
+      (left, right) => left - right,
+    ),
+    formulaCells,
+    protectedRanges,
+  };
 }
 
 function assertBoundedRange(range: string, maxCells: number) {

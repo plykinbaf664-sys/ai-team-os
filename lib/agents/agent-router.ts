@@ -7,6 +7,7 @@ import {
 } from "./agent-registry";
 import { runAssistantPipeline } from "./assistant/assistant-core";
 import type { AssistantConversationMessage } from "./assistant/types";
+import type { AssistantProjectContext } from "./assistant/project-context";
 import { runProjectPipeline } from "./project/project-core";
 import { canCallAgent } from "./loop-guard";
 import type {
@@ -65,10 +66,16 @@ export async function routeRootAgentMessage(input: {
   role: RootAgentRole;
   text: string;
   conversation?: AssistantConversationMessage[];
+  assistantContext?: {
+    telegramUserId: number;
+    telegramChatId: number;
+    projectContext?: AssistantProjectContext;
+  };
 }): Promise<RouteAgentMessageResult> {
   if (input.role === "assistant") {
     const pipeline = await runAssistantPipeline(input.text, {
       conversation: input.conversation,
+      projectContext: input.assistantContext?.projectContext,
     });
     const traceId = createRuntimeId("trace");
     const rootRunId = createRuntimeId("run");
@@ -91,7 +98,14 @@ export async function routeRootAgentMessage(input: {
                   ? "needs_confirmation"
                   : "completed",
             depth: 0,
-            payload: { source_text: input.text },
+            payload: {
+              source_text: input.text,
+              ...(pipeline.projectContext?.activeProject
+                ? {
+                    project_id: pipeline.projectContext.activeProject.id,
+                  }
+                : {}),
+            },
             output: {
               outcome: pipeline.outcome.kind,
               response_text: pipeline.text,
@@ -108,6 +122,7 @@ export async function routeRootAgentMessage(input: {
                 return {
                   externalActionId: action.id,
                   actionType: action.type,
+                  projectId: pipeline.projectContext?.activeProject?.id,
                   payload: toJsonObject(action.payload),
                   status: mapActionRequestStatus(result?.status),
                   result,

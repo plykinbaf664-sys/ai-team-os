@@ -6,7 +6,13 @@ import {
   createGoogleSheetsAdapter,
   createGoogleSheetsAdapterFromEnv,
 } from "../lib/integrations/google-sheets/google-sheets-adapter";
+import {
+  formatGoogleSheetsWorkspaceContext,
+  inspectGoogleSheetsWorkspace,
+} from "../lib/integrations/google-sheets/document-context";
+import { executeGoogleSheetsAction } from "../lib/executors/google-sheets-executor";
 import { createOwnProjectOperationsBlueprint } from "../lib/integrations/google-sheets/launch-tracker-blueprint";
+import type { GoogleSheetsAdapter } from "../lib/integrations/google-sheets/types";
 
 test("refreshes and caches a Google OAuth access token", async () => {
   let calls = 0;
@@ -63,6 +69,203 @@ test("finds existing spreadsheets by exact title ignoring letter case", async ()
   assert.doesNotMatch(query || "", /name=/);
   assert.match(query || "", /mimeType=/);
   assert.match(query || "", /trashed=false/);
+});
+
+test("inspects the explicitly mentioned spreadsheet before unrelated documents", async () => {
+  const metadataCalls: string[] = [];
+  const adapter = fakeSheetsAdapter({
+    listSpreadsheets: async () => [
+      {
+        spreadsheetId: "other",
+        spreadsheetUrl: "https://example.com/other",
+        title: "Другой проект",
+        modifiedTime: "2026-07-31T12:00:00Z",
+      },
+      {
+        spreadsheetId: "launch",
+        spreadsheetUrl: "https://example.com/launch",
+        title: "Запуск магазина ИИ-агентов — 90 дней",
+        modifiedTime: "2026-07-30T12:00:00Z",
+      },
+    ],
+    getSpreadsheetMetadata: async (spreadsheetId) => {
+      metadataCalls.push(spreadsheetId);
+      return {
+        spreadsheetId,
+        spreadsheetUrl: `https://example.com/${spreadsheetId}`,
+        title: "Запуск магазина ИИ-агентов — 90 дней",
+        tabs: [
+          {
+            sheetId: 1,
+            title: "Рассылки",
+            rowCount: 100,
+            columnCount: 4,
+            frozenRowCount: 1,
+            frozenColumnCount: 0,
+          },
+        ],
+      };
+    },
+    readRange: async ({ spreadsheetId, range }) => ({
+      spreadsheetId,
+      range,
+      values: [
+        ["Дата", "Сегмент", "Количество", "Комментарий"],
+        ["29.07.2026", "Партнерский", 8, ""],
+      ],
+    }),
+  });
+
+  const context = await inspectGoogleSheetsWorkspace({
+    adapter,
+    sourceText: "Внеси 10 рассылок за 30 июля.",
+    conversation: [
+      {
+        role: "assistant",
+        text: "Работаем с таблицей Запуск магазина и агентов.",
+      },
+    ],
+  });
+  const formatted = formatGoogleSheetsWorkspaceContext(context);
+
+  assert.deepEqual(metadataCalls, ["launch"]);
+  assert.equal(context.inspectedDocuments[0].tabs[0].title, "Рассылки");
+  assert.match(formatted, /Дата \| Сегмент \| Количество/);
+});
+
+test("appends through the values API instead of the physical sheet bottom", async () => {
+  const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+  const responses = [
+    {
+      spreadsheetId: "sheet-1",
+      properties: { title: "Запуск" },
+      sheets: [
+        {
+          properties: {
+            sheetId: 1,
+            title: "Рассылки",
+            gridProperties: { rowCount: 100, columnCount: 4 },
+          },
+        },
+      ],
+      developerMetadata: [],
+    },
+    {
+      updates: {
+        updatedRange: "Рассылки!A12:D12",
+      },
+    },
+    { replies: [] },
+  ];
+  const adapter = createGoogleSheetsAdapter({
+    getAccessToken: async () => "access-token",
+    fetchImplementation: (async (input, init) => {
+      calls.push({
+        url: String(input),
+        method: init?.method ?? "GET",
+        body:
+          typeof init?.body === "string"
+            ? JSON.parse(init.body)
+            : undefined,
+      });
+      return Response.json(responses.shift() ?? {});
+    }) as typeof fetch,
+  });
+
+  const result = await adapter.appendRows({
+    spreadsheetId: "sheet-1",
+    range: "'Рассылки'!A:D",
+    values: [["30.07.2026", "Партнерский", 10, ""]],
+    idempotencyKey: "metric-1",
+  });
+
+  assert.equal(result.updatedRange, "Рассылки!A12:D12");
+  assert.match(calls[1].url, /\/values\/.*:append\?/);
+  assert.equal(calls[1].method, "POST");
+  assert.doesNotMatch(JSON.stringify(calls[2].body), /appendCells/);
+});
+
+test("verifies an appended row by reading the returned range", async () => {
+  const readRanges: string[] = [];
+  const adapter = fakeSheetsAdapter({
+    getSpreadsheetMetadata: async () => ({
+      spreadsheetId: "launch",
+      spreadsheetUrl: "https://example.com/launch",
+      title: "Запуск магазина ИИ-агентов — 90 дней",
+      tabs: [
+        {
+          sheetId: 1,
+          title: "СЕГМЕНТЫ КОНТАКТОВ",
+          rowCount: 100,
+          columnCount: 10,
+          frozenRowCount: 2,
+          frozenColumnCount: 0,
+        },
+      ],
+    }),
+    appendRows: async () => ({
+      updatedRange: "СЕГМЕНТЫ КОНТАКТОВ!A14:J14",
+      reused: false,
+    }),
+    readRange: async ({ spreadsheetId, range }) => {
+      readRanges.push(range);
+      return {
+        spreadsheetId,
+        range,
+        values: [
+          [
+            "2026-07-30",
+            "Рассылка 30.07",
+            "Партнёры / Консалтинг",
+            null,
+            null,
+            "отправлено",
+            10,
+            null,
+            null,
+            "",
+          ],
+        ],
+      };
+    },
+  });
+
+  const result = await executeGoogleSheetsAction(
+    {
+      id: "action-1",
+      type: "update_sheet",
+      payload: {
+        target: {
+          kind: "id",
+          spreadsheetId: "launch",
+        },
+        range: "'СЕГМЕНТЫ КОНТАКТОВ'!A:J",
+        operation: "append_rows",
+        values: [
+          [
+            "2026-07-30",
+            "Рассылка 30.07",
+            "Партнёры / Консалтинг",
+            null,
+            null,
+            "отправлено",
+            10,
+            null,
+            null,
+            "",
+          ],
+        ],
+      },
+    },
+    adapter,
+  );
+
+  assert.equal(result?.status, "succeeded");
+  assert.equal(
+    readRanges.at(-1),
+    "СЕГМЕНТЫ КОНТАКТОВ!A14:J14",
+  );
+  assert.match(result?.message ?? "", /Проверенный диапазон/);
 });
 
 test("reads metadata and a bounded range from an existing spreadsheet", async () => {
@@ -130,6 +333,94 @@ test("reads metadata and a bounded range from an existing spreadsheet", async ()
   assert.equal(metadata.tabs[0].frozenRowCount, 1);
   assert.deepEqual(range.values[1], ["Реклама", "1000"]);
   assert.match(urls[2], /valueRenderOption=FORMATTED_VALUE/);
+});
+
+test("reads formula and protected-column metadata for a sheet profile", async () => {
+  const urls: string[] = [];
+  const responses = [
+    {
+      spreadsheetId: "existing-1",
+      properties: { title: "Аутрич" },
+      sheets: [
+        {
+          properties: {
+            sheetId: 10,
+            title: "Сегменты",
+            gridProperties: { rowCount: 100, columnCount: 4 },
+          },
+        },
+      ],
+    },
+    {
+      sheets: [
+        {
+          properties: { sheetId: 10, title: "Сегменты" },
+          protectedRanges: [
+            {
+              range: {
+                sheetId: 10,
+                startRowIndex: 1,
+                endRowIndex: 12,
+                startColumnIndex: 1,
+                endColumnIndex: 2,
+              },
+            },
+          ],
+          data: [
+            {
+              startRow: 10,
+              startColumn: 0,
+              rowData: [
+                {
+                  values: [
+                    {},
+                    {},
+                    {
+                      userEnteredValue: {
+                        formulaValue: "=IFERROR(D2/C2;0)",
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ];
+  const adapter = createGoogleSheetsAdapter({
+    getAccessToken: async () => "access-token",
+    fetchImplementation: (async (input) => {
+      urls.push(String(input));
+      return Response.json(responses.shift() ?? {});
+    }) as typeof fetch,
+  });
+
+  const metadata = await adapter.readSheetGridMetadata({
+    spreadsheetId: "existing-1",
+    range: "'Сегменты'!A1:D12",
+  });
+
+  assert.deepEqual(metadata.formulaColumns, [2]);
+  assert.deepEqual(metadata.protectedColumns, [1]);
+  assert.deepEqual(metadata.formulaCells, [
+    {
+      rowIndex: 10,
+      columnIndex: 2,
+      formula: "=IFERROR(D2/C2;0)",
+    },
+  ]);
+  assert.deepEqual(metadata.protectedRanges, [
+    {
+      startRowIndex: 1,
+      endRowIndex: 12,
+      startColumnIndex: 1,
+      endColumnIndex: 2,
+    },
+  ]);
+  assert.match(urls[1], /includeGridData=true/);
+  assert.match(urls[1], /ranges=/);
 });
 
 test("rejects unbounded reads before requesting cell values", async () => {
@@ -375,3 +666,33 @@ test(
     );
   },
 );
+
+function fakeSheetsAdapter(
+  overrides: Partial<GoogleSheetsAdapter> = {},
+): GoogleSheetsAdapter {
+  return {
+    createSpreadsheet: async () => {
+      throw new Error("Not implemented in test.");
+    },
+    findSpreadsheetsByTitle: async () => [],
+    listSpreadsheets: async () => [],
+    getSpreadsheetMetadata: async () => {
+      throw new Error("Not implemented in test.");
+    },
+    readRange: async () => {
+      throw new Error("Not implemented in test.");
+    },
+    readSheetGridMetadata: async () => ({
+      spreadsheetId: "test",
+      sheetId: 1,
+      sheetName: "Test",
+      formulaColumns: [],
+      protectedColumns: [],
+    }),
+    createSheetTab: async () => ({ sheetId: 1, reused: false }),
+    appendRows: async () => ({ reused: false }),
+    updateCells: async () => undefined,
+    clearRange: async () => undefined,
+    ...overrides,
+  };
+}

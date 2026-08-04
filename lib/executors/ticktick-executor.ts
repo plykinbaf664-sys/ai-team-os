@@ -12,6 +12,10 @@ import type {
   TickTickProject,
   TickTickTask,
 } from "../integrations/ticktick/types";
+import {
+  buildTaskSourceContent,
+  buildTaskSourceMarker,
+} from "../agents/assistant/ticktick-coordination";
 
 type TickTickAction = Extract<
   AssistantAction,
@@ -230,10 +234,17 @@ async function executeCreateTask(
   }
 
   const projectData = await adapter.getProjectData(project.projectId);
+  const sourceMarker = action.payload.sourceEntity
+    ? buildTaskSourceMarker(
+        action.payload.sourceEntity,
+        action.payload.title,
+      )
+    : undefined;
   const duplicate = projectData.tasks.find(
     (task) =>
       task.status === 0 &&
-      normalizeTitle(task.title) === normalizeTitle(action.payload.title),
+      (normalizeTitle(task.title) === normalizeTitle(action.payload.title) ||
+        (sourceMarker && task.content?.includes(sourceMarker))),
   );
 
   if (duplicate) {
@@ -256,6 +267,14 @@ async function executeCreateTask(
   const created = await adapter.createTask({
     projectId: project.projectId,
     title: action.payload.title.trim(),
+    ...(action.payload.sourceEntity
+      ? {
+          content: buildTaskSourceContent(
+            action.payload.sourceEntity,
+            action.payload.title,
+          ),
+        }
+      : {}),
     priority: mapPriority(action.payload.priority),
     ...(dueDate.kind === "resolved"
       ? {
@@ -268,7 +287,14 @@ async function executeCreateTask(
 
   return success(
     action,
-    `Задача создана в TickTick, список «${project.projectName}»: ${created.title}.`,
+    [
+      `Задача создана в TickTick, список «${project.projectName}»: ${created.title}.`,
+      action.payload.sourceEntity
+        ? "Связал её с исходной строкой Google Sheets."
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
   );
 }
 
@@ -576,9 +602,15 @@ export function resolveTaskDueDate(
   } else if (/\bсегодня\b/u.test(normalized)) {
     date = localDate;
   } else {
+    const relativeDays = normalized.match(
+      /через\s+(\d{1,3})\s+(?:день|дня|дней)/u,
+    );
+    const days = relativeDays ? Number(relativeDays[1]) : null;
     const weekday = extractWeekday(normalized);
 
-    if (weekday !== null) {
+    if (days !== null && days >= 1 && days <= 365) {
+      date = addDays(localDate, days);
+    } else if (weekday !== null) {
       date = addDays(localDate, (weekday - localDate.getUTCDay() + 7) % 7);
     }
   }
