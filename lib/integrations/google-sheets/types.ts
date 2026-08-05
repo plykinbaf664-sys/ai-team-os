@@ -247,6 +247,7 @@ export type SheetProfile = {
     | "task"
     | "metric_record"
     | "activity_log"
+    | "contact_record"
     | "generic_table";
   headerRowNumber: number;
   columns: SheetColumnProfile[];

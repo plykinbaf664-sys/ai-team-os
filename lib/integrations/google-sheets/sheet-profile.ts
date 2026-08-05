@@ -142,26 +142,37 @@ function classifyColumn({
       normalized,
     );
   const isStatus = /статус|состояни|этап|стадия/i.test(normalized);
-  const isComment = /коммент|замет|примечан|итог/i.test(normalized);
+  const isComment = /коммент|замет|примечан|итог|текущ.*процесс|следующ.*действ|следующ.*шаг/i.test(normalized);
+  const isOperationalField = [
+    "first_contact_at",
+    "next_contact_at",
+    "interview_at",
+    "current_process",
+  ].includes(semanticKey);
   const isKey =
+    !isOperationalField &&
     /сегмент|оффер.*результ|результ.*оффер|направлен|контакт|клиент|партнер|партнёр|проект|имя|названи|entity|(^|_)id($|_)/i.test(
       normalized,
     );
   const protectedByMeaning =
-    isStrategicText || isPlannedMetric || (!isMetric && !isStatus && !isComment && !isKey);
+    isStrategicText ||
+    isPlannedMetric ||
+    (!isMetric && !isStatus && !isComment && !isKey && !isOperationalField);
   const isProtected =
     isFormula || isExplicitlyProtected || protectedByMeaning;
   const role = isFormula
     ? "formula"
-    : isKey
-      ? "key"
-      : isStatus
-        ? "status"
-        : isMetric
-          ? "metric"
-          : isComment || isStrategicText
-            ? "text"
-            : "unknown";
+    : isOperationalField
+      ? "text"
+      : isKey
+        ? "key"
+        : isStatus
+          ? "status"
+          : isMetric
+            ? "metric"
+            : isComment || isStrategicText
+              ? "text"
+              : "unknown";
   const updatePolicy = isFormula
     ? "formula"
     : isProtected
@@ -175,7 +186,9 @@ function classifyColumn({
         : role === "status"
           ? "replace"
           : role === "text"
-            ? "append_text"
+            ? semanticKey.endsWith("_at")
+              ? "replace"
+              : "append_text"
             : "preserve";
 
   return {
@@ -195,6 +208,14 @@ function inferEntityType(
   columns: SheetColumnProfile[],
 ): SheetProfile["entityType"] {
   const text = columns.map((column) => normalizeText(column.header)).join(" ");
+
+  if (
+    /(?:^| )имя(?: |$)|контакт/.test(text) &&
+    /источник контакта|дата интервью|текущий процесс/.test(text) &&
+    /статус/.test(text)
+  ) {
+    return "contact_record";
+  }
 
   if (
     /сегмент/.test(text) &&
@@ -226,6 +247,14 @@ function selectKeyColumns(
   columns: SheetColumnProfile[],
   entityType: SheetProfile["entityType"],
 ) {
+  if (entityType === "contact_record") {
+    const contactKeys = ["name", "contact_name", "source_contact", "company"]
+      .filter((semanticKey) =>
+        columns.some((column) => column.semanticKey === semanticKey),
+      );
+    if (contactKeys.length) return contactKeys.slice(0, 2);
+  }
+
   const explicit = columns
     .filter((column) => column.role === "key")
     .map((column) => column.semanticKey);
@@ -257,6 +286,8 @@ function inferPurpose(
       return "Учёт показателей и план-факт";
     case "activity_log":
       return "Журнал операционных действий";
+    case "contact_record":
+      return "Карточки контактов, лидов, созвонов и следующих действий";
     default:
       return `Данные листа «${sheetName}»`;
   }
@@ -320,6 +351,17 @@ function inferDataType(
 
 function inferSemanticKey(normalizedHeader: string, index: number) {
   const mappings: Array<[RegExp, string]> = [
+    [/^компания$|название компании/, "company"],
+    [/^имя$|имя контакта/, "name"],
+    [/^контакт$/, "contact_name"],
+    [/должност|роль контакта/, "position"],
+    [/^источник контакта$|ссылка.*(?:контакт|профил|аккаунт)/, "source_contact"],
+    [/дата.*перв.*сообщ|перв.*контакт.*дат/, "first_contact_at"],
+    [/дата.*след.*контакт|след.*контакт.*дат/, "next_contact_at"],
+    [/дата.*интервью|дата.*созвон/, "interview_at"],
+    [/текущ.*процесс/, "current_process"],
+    [/основн.*проблем/, "main_problem"],
+    [/частот.*проблем/, "problem_frequency"],
     [/сегмент/, "segment"],
     [/оффер.*результ|результ.*оффер/, "offer_result"],
     [/перв.*сообщ/, "first_message"],

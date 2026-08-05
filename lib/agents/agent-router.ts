@@ -24,6 +24,7 @@ import {
   buildResearchAgentPrompt,
   researchAgentSystemPrompt,
 } from "./prompts/research-agent";
+import { runResearchTask } from "./research/research-agent";
 
 type RouteAgentMessageInput = {
   role: AgentRole;
@@ -144,11 +145,23 @@ export async function routeRootAgentMessage(input: {
     };
   }
 
-  const pipeline = runProjectPipeline(input.text);
+  const pipeline = await runProjectPipeline(input.text);
+  const researchArtifact = pipeline.report.artifacts.find(
+    (artifact) => artifact.agentRole === "research",
+  );
 
   return {
     role: "project",
     text: pipeline.text,
+    ...(researchArtifact
+      ? {
+          document: {
+            filename: researchArtifact.content.filename,
+            content: researchArtifact.content.markdown,
+            caption: researchArtifact.title,
+          },
+        }
+      : {}),
     persistence: {
       traceId: pipeline.state.traceId,
       rootRunId: pipeline.state.rootRunId,
@@ -175,10 +188,12 @@ export async function routeRootAgentMessage(input: {
           payload: {
             task: run.request.payload.task,
             project_goal: run.request.payload.projectGoal,
+            input_artifact_ids: run.request.payload.inputArtifactIds,
           },
-          output: run.artifactId
-            ? { artifact_id: run.artifactId }
-            : undefined,
+          output: createProjectRunOutput(
+            run.artifactId,
+            run.errorMessage,
+          ),
         })),
       ],
       actions: [],
@@ -189,7 +204,7 @@ export async function routeRootAgentMessage(input: {
         runId: artifact.runId,
         type: artifact.type,
         title: artifact.title,
-        content: { text: artifact.content },
+        content: toJsonObject(artifact.content),
         createdAt: artifact.createdAt,
       })),
     },
@@ -209,6 +224,15 @@ function mapActionRequestStatus(
   }
 
   return resultStatus ?? "ready";
+}
+
+function createProjectRunOutput(
+  artifactId?: string,
+  errorMessage?: string,
+): JsonObject | undefined {
+  if (artifactId) return { artifact_id: artifactId };
+  if (errorMessage) return { error: errorMessage };
+  return undefined;
 }
 
 function toJsonObject(value: unknown): JsonObject {
@@ -372,142 +396,26 @@ async function routeDelegatedResearchAgent(
 async function generateResearchReportResult(
   input: RouteAgentMessageInput,
 ): Promise<RouteAgentMessageResult> {
-  const report = await generateResearchReportMarkdown(input);
-  const filename = buildResearchReportFilename(input.text);
+  const report = await runResearchTask({
+    task: input.text,
+    projectGoal: input.text,
+    userName: input.userName,
+  });
 
   return {
     role: "research",
     text: [
       "Research Agent: готов отчет.",
       "",
-      `Файл: ${filename}`,
+      `Файл: ${report.filename}`,
       "Внутри: срез рынка, спрос, деньги в нише, конкуренты, позиционирование, риски, источники и вердикт по запуску.",
     ].join("\n"),
     document: {
-      filename,
-      content: report,
+      filename: report.filename,
+      content: report.markdown,
       caption: "Research report",
     },
   };
-}
-
-async function generateResearchReportMarkdown(input: RouteAgentMessageInput) {
-  const apiKey = process.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    return [
-      "# Research Report",
-      "",
-      "OpenAI API key is missing, so live web research could not run.",
-      "",
-      "Add `OPENAI_API_KEY` to `.env.local` and retry the research request.",
-    ].join("\n");
-  }
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model:
-        process.env.OPENAI_RESEARCH_MODEL ||
-        process.env.OPENAI_MODEL ||
-        "gpt-4.1-mini",
-      tools: [
-        {
-          type: process.env.OPENAI_WEB_SEARCH_TOOL || "web_search_preview",
-        },
-      ],
-      tool_choice: "auto",
-      input: [
-        {
-          role: "system",
-          content: buildResearchReportSystemPrompt(),
-        },
-        {
-          role: "user",
-          content: buildResearchReportPrompt(input),
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenAI research request failed: ${errorText}`);
-  }
-
-  const data = (await response.json()) as OpenAIResponse;
-  const text = extractOpenAIText(data);
-
-  if (!text) {
-    throw new Error("OpenAI research response did not contain text.");
-  }
-
-  return appendSourcesIfNeeded(text, data);
-}
-
-function buildResearchReportSystemPrompt() {
-  return [
-    researchAgentSystemPrompt,
-    "",
-    "Act as a professional marketing strategist, market analyst, and competitive intelligence expert.",
-    "You have access to web search. Use it for current market and competitor research.",
-    "Use current internet search. Do not rely only on general knowledge.",
-    "Return a polished Markdown document in Russian.",
-    "Make citations and source URLs visible in the Markdown.",
-    "Prioritize primary sources: competitor landing pages, course pages, pricing pages, social pages, sales pages, webinars, lead magnets, checkout pages, YouTube descriptions, Telegram channels, and ad libraries when available.",
-    "Avoid generic market fluff. Every conclusion must be tied to a concrete observation, source, fact, hypothesis, or action.",
-    "If you cannot find a concrete price, funnel step, product lineup, lead magnet, or promise, write 'не найдено в доступных источниках'. Do not invent it.",
-    "Write harshly, concretely, and practically. Do not use generic phrases like 'важно создавать ценность', 'нужно выделяться', or 'анализируйте аудиторию'.",
-    "Your task is to determine whether there is money in the niche, whether the market is alive, whether it is worth entering, which competitors are already making money, where they are strong or weak, which positioning can stand out, and which offers, products, prices, funnels, and meanings should be used.",
-    "The competitor section must be a dense table, not paragraphs.",
-    "For each competitor include: product/company, URL, target audience, product lineup, core promise, funnel entry, funnel steps, price/payment terms if found, proof/source, positioning weakness, opportunity for us.",
-    "After the competitor table, write a short 'What this means for us' section with specific positioning moves.",
-    "Do not return JSON.",
-    "Use this structure:",
-    "# Research Report: <niche>",
-    "## 1. Исходные данные",
-    "Include niche, geography, target audience if known, product/service format, price segment, and competitor-analysis criteria. If missing, write 'не указано'.",
-    "## 2. Срез рынка",
-    "Evaluate: market aliveness, demand, signs of money, audience purchasing power, growth/stagnation, trends, competition intensity, entry difficulty, and unmet needs. End with: рынок слабый / средний / сильный and why.",
-    "## 3. Деньги в нише",
-    "Analyze what people already pay for, bought products/services, likely average checks, where money volume is, monetization formats, whether expensive products can be sold, repeat-sales potential, product-line potential. Give money-potential score 1-10.",
-    "## 4. Анализ конкурентов",
-    "For each competitor analyze: who they are, what they sell, whom they sell to, positioning, main offer, product lineup, price/segment, site/social/profile packaging, audience pains, communication meanings, strengths, weaknesses, gaps, revenue mechanics, what to copy, and where to differentiate. If data is insufficient, write 'нет данных / нужно проверить / гипотеза'.",
-    "## 5. Сравнительная таблица",
-    "Columns: competitor, positioning, offer, audience, product, price/segment, strengths, weaknesses, differentiation opportunity, threat level low/medium/high.",
-    "## 6. Дыры рынка",
-    "Find what competitors do badly, weakly covered pains, unused formats, identical promises, overheated areas, free space, underserved audience segments, and meanings we can own.",
-    "## 7. Возможное позиционирование",
-    "Offer 3-5 positioning options. For each: essence, audience, main offer, why it can work, difference from competitors, risks, required content and packaging.",
-    "## 8. Рекомендация по входу в нишу",
-    "Give honest verdict: enter or not, approach, segment, first product, test price, funnel, hypotheses to validate, metrics to track, money-losing mistakes.",
-    "## 9. Итоговый вывод как маркетолог",
-    "Use this exact format: потенциал ниши: 1-10; уровень конкуренции: 1-10; сложность входа: 1-10; денежность: 1-10; шанс успешного запуска: 1-10; лучший угол входа; главный риск; главная возможность; что делать первым шагом.",
-    "## 10. Источники",
-  ].join("\n");
-}
-
-function buildResearchReportPrompt(input: RouteAgentMessageInput) {
-  return [
-    `User: ${input.userName}`,
-    "Research task from Telegram group chat:",
-    input.text,
-    "",
-    "If the task contains an original niche and later user criteria, keep the original niche as the mandatory research subject. Do not switch to another market or infer a different niche.",
-    "If the niche is crypto trading education, the report must stay about crypto trading education and adjacent competitor offers only.",
-    "Prepare a practical market research report.",
-    "Evaluate whether this niche is alive, whether there is money in it, how frequent and urgent customer demand appears to be, how competitive the space is, and how our launch can stand out.",
-    "Do not satisfy the request with broad descriptions. The user needs actionable competitor intelligence.",
-    "Use the user's requested criteria exactly. If criteria are missing, default to: offer, price, packaging, content, funnel, reviews, positioning, USP, lead magnet, social media, website, product lineup, audience pains, ad creatives.",
-    "If the user provided criteria, use exactly those criteria as the main competitor-analysis columns.",
-    "If the user asked for two competitors, analyze exactly two strong relevant competitors. If a stronger competitor is found than the first result, choose the stronger one and explain why.",
-    "For crypto trading education, focus on offers that teach trading crypto/crypto markets, not generic investing or unrelated online education.",
-    "Use web search and cite sources.",
-  ].join("\n");
 }
 
 async function generateAgentReply({
@@ -577,68 +485,6 @@ function extractOpenAIText(data: OpenAIResponse) {
     .filter(Boolean)
     .join("\n")
     .trim();
-}
-
-function appendSourcesIfNeeded(text: string, data: OpenAIResponse) {
-  if (/^##\s+Sources/im.test(text) || /^##\s+Источники/im.test(text)) {
-    return text.trim();
-  }
-
-  const sources = extractOpenAISources(data);
-
-  if (!sources.length) {
-    return text.trim();
-  }
-
-  return [
-    text.trim(),
-    "",
-    "## Sources",
-    ...sources.map((source, index) => {
-      const title = source.title || source.url;
-      return `${index + 1}. [${title}](${source.url})`;
-    }),
-  ].join("\n");
-}
-
-function extractOpenAISources(data: OpenAIResponse) {
-  const sources = new Map<string, { url: string; title?: string }>();
-
-  for (const source of data.sources ?? []) {
-    if (source.url) {
-      sources.set(source.url, {
-        url: source.url,
-        title: source.title,
-      });
-    }
-  }
-
-  for (const item of data.output ?? []) {
-    for (const content of item.content ?? []) {
-      for (const annotation of content.annotations ?? []) {
-        if (annotation.url) {
-          sources.set(annotation.url, {
-            url: annotation.url,
-            title: annotation.title,
-          });
-        }
-      }
-    }
-  }
-
-  return Array.from(sources.values());
-}
-
-function buildResearchReportFilename(text: string) {
-  const date = new Date().toISOString().slice(0, 10);
-  const slug =
-    text
-      .toLowerCase()
-      .replace(/[^a-zа-я0-9]+/gi, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 48) || "research";
-
-  return `research-report-${date}-${slug}.md`;
 }
 
 function buildAgentPrompt(input: RouteAgentMessageInput) {

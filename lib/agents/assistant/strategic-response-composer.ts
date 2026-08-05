@@ -18,6 +18,18 @@ export function composeStrategicResponse(
   results: ActionResult[],
   policyQuestions: string[] = [],
 ) {
+  const dailySummary = results.find(
+    (result) =>
+      result.actionType === "generate_daily_summary" &&
+      result.status === "succeeded",
+  );
+  if (
+    dailySummary &&
+    results.length === 1 &&
+    policyQuestions.length === 0
+  ) {
+    return dailySummary.message;
+  }
   const succeeded = results.filter((result) => result.status === "succeeded");
   const failed = results.filter((result) => result.status === "failed");
   const needsClarification = results.filter(

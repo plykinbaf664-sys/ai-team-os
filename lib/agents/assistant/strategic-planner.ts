@@ -17,6 +17,11 @@ import type {
   SuggestedAction,
   UpdateSheetAction,
 } from "./types";
+import { columnName } from "../../integrations/google-sheets/sheet-profile";
+import {
+  resolveDateFromText,
+  resolveTimeRangeFromText,
+} from "./conversation-reconciliation";
 
 type StrategicPlanInput = {
   sourceText: string;
@@ -105,8 +110,22 @@ export function reconcileStrategicPlanWithSheets(
   outcome: AssistantPlanOutcome,
   sourceText: string,
   workspace?: GoogleSheetsWorkspaceContext,
+  {
+    timezone,
+    now = new Date(),
+  }: {
+    timezone?: string;
+    now?: Date;
+  } = {},
 ): AssistantPlanOutcome {
   if (outcome.kind !== "ready" || !workspace) return outcome;
+  const contactOutcome = reconcileContactRecord(
+    outcome,
+    sourceText,
+    workspace,
+    { timezone, now },
+  );
+  if (contactOutcome) return contactOutcome;
   const increment = extractOutreachIncrement(sourceText);
   const explicitTotal = extractExplicitOutreachTotal(sourceText);
   if (increment === null && explicitTotal === null) return outcome;
@@ -254,6 +273,394 @@ export function reconcileStrategicPlanWithSheets(
       },
     },
   };
+}
+
+function reconcileContactRecord(
+  outcome: Extract<AssistantPlanOutcome, { kind: "ready" }>,
+  sourceText: string,
+  workspace: GoogleSheetsWorkspaceContext,
+  {
+    timezone,
+    now,
+  }: {
+    timezone?: string;
+    now: Date;
+  },
+): AssistantPlanOutcome | null {
+  const sheetWriteRequested =
+    /(?:таблиц|google\s*sheets?|гугл[^\n]*таблиц)/iu.test(sourceText) &&
+    /(?:добав|занес|внес|зафикс|запиш|обнов)/iu.test(sourceText);
+  const contactIntent =
+    /(?:аккаунт|контакт|карточк|человек|лид|сделк|созвон|встреч)/iu.test(sourceText) ||
+    /https?:\/\//iu.test(sourceText);
+  const plannedSheetAction = outcome.plan.actions.find(
+    (action): action is UpdateSheetAction => action.type === "update_sheet",
+  );
+
+  if (!contactIntent || (!sheetWriteRequested && !plannedSheetAction)) {
+    return null;
+  }
+
+  const contactTabs = workspace.inspectedDocuments.flatMap((document) =>
+    document.tabs
+      .filter((tab) => tab.profile.entityType === "contact_record")
+      .map((tab) => ({ document, tab })),
+  );
+  const rankedTabs = contactTabs.sort(
+    (left, right) =>
+      contactTabScore(right.tab.title) - contactTabScore(left.tab.title),
+  );
+  const firstTab = rankedTabs[0];
+
+  if (!firstTab) {
+    return {
+      kind: "clarification",
+      question:
+        "Не нашёл в связанных документах операционный лист с карточками контактов. Как называется такая таблица или лист?",
+      missingField: "sheet.contact_resource",
+    };
+  }
+  if (
+    rankedTabs[1] &&
+    contactTabScore(firstTab.tab.title) === contactTabScore(rankedTabs[1].tab.title)
+  ) {
+    return {
+      kind: "clarification",
+      question: `Нашёл два равнозначных листа контактов: «${firstTab.tab.title}» и «${rankedTabs[1].tab.title}». В какой вести эту карточку?`,
+      missingField: "sheet.contact_resource",
+    };
+  }
+
+  const url = extractUrl(sourceText);
+  const explicitName = extractContactName(sourceText);
+  if (!url && !explicitName) {
+    return {
+      kind: "clarification",
+      question: "Кого добавить? Пришли имя или ссылку на контакт.",
+      missingField: "sheet.contact_identity",
+    };
+  }
+
+  const date = resolveDateFromText(sourceText, now, timezone);
+  const { startTime, endTime } = resolveTimeRangeFromText(sourceText);
+  const existingMatches = firstTab.tab.rowMatches.filter(
+    (match) =>
+      match.confidence >= firstTab.tab.profile.rowMatchingRules.minimumConfidence &&
+      isExactContactIdentity(
+        firstTab.tab,
+        match.entity.values,
+        url,
+        explicitName,
+      ),
+  );
+  if (
+    existingMatches[1] &&
+    existingMatches[0].confidence - existingMatches[1].confidence <
+      firstTab.tab.profile.rowMatchingRules.ambiguityDelta
+  ) {
+    return {
+      kind: "clarification",
+      question: `Нашёл несколько похожих контактов: «${shortRowKey(existingMatches[0].entity.rowKey)}» и «${shortRowKey(existingMatches[1].entity.rowKey)}». Какой из них обновить?`,
+      missingField: "sheet.contact_row",
+    };
+  }
+
+  const existing = existingMatches[0];
+  const contactActions = existing
+    ? buildExistingContactUpdates({
+        actionId: plannedSheetAction?.id ?? "action-contact",
+        spreadsheetId: firstTab.document.spreadsheetId,
+        tab: firstTab.tab,
+        rowNumber: existing.entity.rowNumber,
+        existingValues: existing.entity.values,
+        sourceText,
+        url,
+        date,
+        startTime,
+        endTime,
+      })
+    : [
+        buildNewContactAppend({
+          actionId: plannedSheetAction?.id ?? "action-contact",
+          spreadsheetId: firstTab.document.spreadsheetId,
+          tab: firstTab.tab,
+          sourceText,
+          url,
+          explicitName,
+          date,
+          startTime,
+          endTime,
+        }),
+      ];
+
+  const actions = replacePlannedSheetAction(
+    outcome.plan.actions,
+    plannedSheetAction,
+    contactActions,
+  );
+  const base = outcome.plan.strategicPlan ??
+    createFallbackStrategicActionPlan({ sourceText, actions });
+  const contactIds = new Set(contactActions.map((action) => action.id));
+  const strategicActions = actions.map((action) => {
+    const previous = base.actions.find(
+      (candidate) =>
+        candidate.kind === "execute_action" &&
+        candidate.linkedActionId === action.id,
+    );
+    if (!contactIds.has(action.id)) {
+      return previous ?? fallbackStrategicAction(action, sourceText);
+    }
+    return {
+      ...(previous ?? fallbackStrategicAction(action, sourceText)),
+      id: `execute-${action.id}`,
+      linkedActionId: action.id,
+      actionType: "update_sheet" as const,
+      reason: existing
+        ? "Контакт уверенно найден по данным сообщения; обновляется его существующая карточка."
+        : "Пользователь прямо попросил добавить новый контакт в связанную операционную таблицу.",
+      evidence: [url ?? explicitName ?? sourceText.trim()],
+      confidence: 1,
+      executionPolicy: "auto_execute" as const,
+      expectedChange: existing
+        ? `Обновить карточку контакта в строке ${existing.entity.rowNumber}.`
+        : `Добавить одну карточку в лист «${firstTab.tab.title}».`,
+      verification: "Повторно прочитать изменённую строку и сверить сохранённые факты.",
+    };
+  });
+
+  return {
+    kind: "ready",
+    plan: {
+      ...outcome.plan,
+      actions,
+      strategicPlan: {
+        ...base,
+        targetResources: [
+          ...base.targetResources.filter(
+            (resource) => resource.type !== "google_sheet",
+          ),
+          {
+            type: "google_sheet",
+            externalId: firstTab.document.spreadsheetId,
+            title: firstTab.document.title,
+            sheetName: firstTab.tab.title,
+            ...(existing
+              ? {
+                  entityId: existing.entity.entityId,
+                  entityLabel: shortRowKey(existing.entity.rowKey),
+                  rowNumber: existing.entity.rowNumber,
+                }
+              : {}),
+          },
+        ],
+        factsFromContext: upsertFact(base.factsFromContext, {
+          key: "contact_sheet_resolution",
+          value: firstTab.tab.title,
+          source: "resource_context",
+          evidence: `Sheet Profile: entity_type=contact_record; лист «${firstTab.tab.title}».`,
+        }),
+        actions: strategicActions,
+        summaryIntent: existing
+          ? `Обновить существующую карточку контакта в листе «${firstTab.tab.title}».`
+          : `Добавить новую карточку контакта в лист «${firstTab.tab.title}», сохранив только известные факты.`,
+      },
+    },
+  };
+}
+
+function buildNewContactAppend({
+  actionId,
+  spreadsheetId,
+  tab,
+  sourceText,
+  url,
+  explicitName,
+  date,
+  startTime,
+  endTime,
+}: {
+  actionId: string;
+  spreadsheetId: string;
+  tab: InspectedSheetTab;
+  sourceText: string;
+  url?: string;
+  explicitName?: string;
+  date?: string;
+  startTime?: string;
+  endTime?: string;
+}): UpdateSheetAction {
+  const values = tab.profile.columns.map((column) => {
+    switch (column.semanticKey) {
+      case "name":
+      case "contact_name":
+        return explicitName ?? null;
+      case "source_contact":
+        return url ?? null;
+      case "next_contact_at":
+        return date ?? null;
+      case "status":
+        return date && startTime && /созвон|встреч/iu.test(sourceText)
+          ? "Созвон назначен"
+          : null;
+      case "interview_at":
+        return date && startTime ? `${date} ${startTime}` : null;
+      case "current_process":
+        return buildContactProcess(sourceText, url, date, startTime, endTime);
+      default:
+        return null;
+    }
+  });
+
+  return {
+    id: actionId,
+    type: "update_sheet",
+    payload: {
+      target: { kind: "id", spreadsheetId },
+      range: `'${tab.title.replace(/'/g, "''")}'!A:${columnName(tab.profile.columns.length - 1)}`,
+      operation: "append_rows",
+      values: [values],
+    },
+  };
+}
+
+function buildExistingContactUpdates({
+  actionId,
+  spreadsheetId,
+  tab,
+  rowNumber,
+  existingValues,
+  sourceText,
+  url,
+  date,
+  startTime,
+  endTime,
+}: {
+  actionId: string;
+  spreadsheetId: string;
+  tab: InspectedSheetTab;
+  rowNumber: number;
+  existingValues: unknown[];
+  sourceText: string;
+  url?: string;
+  date?: string;
+  startTime?: string;
+  endTime?: string;
+}) {
+  const updates: Array<{ semanticKey: string; value: string }> = [];
+  if (date) updates.push({ semanticKey: "next_contact_at", value: date });
+  if (date && startTime && /созвон|встреч/iu.test(sourceText)) {
+    updates.push({ semanticKey: "status", value: "Созвон назначен" });
+    updates.push({ semanticKey: "interview_at", value: `${date} ${startTime}` });
+  }
+  const processColumn = tab.profile.columns.find(
+    (column) => column.semanticKey === "current_process",
+  );
+  if (processColumn) {
+    const previous = String(existingValues[processColumn.index] ?? "").trim();
+    const next = buildContactProcess(sourceText, url, date, startTime, endTime);
+    updates.push({
+      semanticKey: "current_process",
+      value: previous && !previous.includes(next) ? `${previous}\n${next}` : next,
+    });
+  }
+
+  return updates.flatMap((update, index): UpdateSheetAction[] => {
+    const column = tab.profile.columns.find(
+      (candidate) => candidate.semanticKey === update.semanticKey,
+    );
+    if (!column || column.isProtected || column.isFormula) return [];
+    return [{
+      id: index === 0 ? actionId : `${actionId}-${index + 1}`,
+      type: "update_sheet",
+      payload: {
+        target: { kind: "id", spreadsheetId },
+        range: `'${tab.title.replace(/'/g, "''")}'!${column.columnLetter}${rowNumber}`,
+        operation: "update_cells",
+        values: [[update.value]],
+      },
+    }];
+  });
+}
+
+function replacePlannedSheetAction(
+  actions: AssistantAction[],
+  planned: UpdateSheetAction | undefined,
+  replacements: UpdateSheetAction[],
+) {
+  if (!planned) return [...replacements, ...actions];
+  return actions.flatMap((action) =>
+    action.id === planned.id ? replacements : [action],
+  );
+}
+
+function buildContactProcess(
+  sourceText: string,
+  url?: string,
+  date?: string,
+  startTime?: string,
+  endTime?: string,
+) {
+  if (date && startTime && /созвон|встреч/iu.test(sourceText)) {
+    const time = endTime ? `${startTime}–${endTime}` : startTime;
+    return `Созвон назначен на ${date}, ${time}${url ? `. Контакт: ${url}` : ""}.`;
+  }
+  return sourceText.trim().replace(/\s+/g, " ").slice(0, 500);
+}
+
+function extractUrl(value: string) {
+  return value.match(/https?:\/\/[^\s,;]+/iu)?.[0].replace(/[).!?]+$/u, "");
+}
+
+function extractContactName(value: string) {
+  return value.match(
+    /(?:контакт|аккаунт|лид|карточк[ау])\s+(?:с\s+)?([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?)/u,
+  )?.[1];
+}
+
+function isExactContactIdentity(
+  tab: InspectedSheetTab,
+  values: unknown[],
+  url?: string,
+  explicitName?: string,
+) {
+  if (url) {
+    const sourceColumn = tab.profile.columns.find(
+      (column) => column.semanticKey === "source_contact",
+    );
+    const stored = sourceColumn
+      ? String(values[sourceColumn.index] ?? "")
+      : "";
+    return normalizeContactIdentity(stored) === normalizeContactIdentity(url);
+  }
+  if (explicitName) {
+    const nameColumns = tab.profile.columns.filter(
+      (column) =>
+        column.semanticKey === "name" ||
+        column.semanticKey === "contact_name",
+    );
+    return nameColumns.some(
+      (column) =>
+        normalizeContactIdentity(String(values[column.index] ?? "")) ===
+        normalizeContactIdentity(explicitName),
+    );
+  }
+  return false;
+}
+
+function normalizeContactIdentity(value: string) {
+  return value
+    .normalize("NFC")
+    .toLocaleLowerCase("ru")
+    .replace(/ё/g, "е")
+    .replace(/\/+$/u, "")
+    .trim();
+}
+
+function contactTabScore(title: string) {
+  if (/^интервью$/iu.test(title.trim())) return 100;
+  if (/интервью/iu.test(title)) return 80;
+  if (/пилот|клиент/iu.test(title)) return 40;
+  return 0;
 }
 
 export function createFallbackStrategicActionPlan({

@@ -94,6 +94,38 @@ test("classifies operational dates before generic follow-up text", () => {
   );
 });
 
+test("recognizes a contact register and keeps operational fields writable", () => {
+  const values: SheetScalar[][] = [
+    ["Карточки интервью"],
+    [],
+    [
+      "Компания",
+      "Сегмент",
+      "Имя",
+      "Должность",
+      "Источник контакта",
+      "Дата первого сообщения",
+      "Дата следующего контакта",
+      "Статус",
+      "Дата интервью",
+      "Текущий процесс",
+      "Основная проблема",
+      "Частота проблемы",
+    ],
+    [null, null, "Марина", null, "https://example.com/marina", null, null, "Новый", null, null, null, null],
+  ];
+  const profile = buildProfile(values);
+
+  assert.equal(profile.entityType, "contact_record");
+  assert.deepEqual(profile.keyColumns, ["name", "source_contact"]);
+  assert.equal(column(profile, "next_contact_at").isProtected, false);
+  assert.equal(column(profile, "next_contact_at").updatePolicy, "replace");
+  assert.equal(column(profile, "interview_at").isProtected, false);
+  assert.equal(column(profile, "interview_at").updatePolicy, "replace");
+  assert.equal(column(profile, "current_process").isProtected, false);
+  assert.equal(column(profile, "current_process").updatePolicy, "append_text");
+});
+
 test("matches the existing outreach row without inventing an entity", () => {
   const profile = buildProfile(VALUES);
   const entities = buildSheetRowEntities(profile, VALUES);
@@ -217,6 +249,17 @@ function buildProfile(values: SheetScalar[][]) {
       protectedColumns: [2, 3, 4],
     },
   });
+}
+
+function column(
+  profile: ReturnType<typeof buildProfile>,
+  semanticKey: string,
+) {
+  const result = profile.columns.find(
+    (candidate) => candidate.semanticKey === semanticKey,
+  );
+  assert.ok(result, `Missing column ${semanticKey}`);
+  return result;
 }
 
 function fakeAdapter(

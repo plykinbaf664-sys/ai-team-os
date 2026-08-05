@@ -103,11 +103,18 @@ export async function inspectSpreadsheet(
   const tabs: InspectedSheetTab[] = [];
   const rankedTabs = [...metadata.tabs].sort(
     (left, right) =>
-      scoreName(right.title, normalizeText(focusText)) -
-      scoreName(left.title, normalizeText(focusText)),
+      scoreTab(right.title, normalizeText(focusText)) -
+      scoreTab(left.title, normalizeText(focusText)),
   );
+  const instructionTab = rankedTabs.find((tab) =>
+    /инструкц.*ассистент/iu.test(tab.title),
+  );
+  const selectedTabs = [
+    ...(instructionTab ? [instructionTab] : []),
+    ...rankedTabs.filter((tab) => tab !== instructionTab),
+  ].slice(0, MAX_TABS_PER_DOCUMENT);
 
-  for (const tab of rankedTabs.slice(0, MAX_TABS_PER_DOCUMENT)) {
+  for (const tab of selectedTabs) {
     const rowCount = Math.max(
       1,
       Math.min(tab.rowCount, MAX_SAMPLE_ROWS),
@@ -288,6 +295,24 @@ function scoreName(value: string, normalizedContext: string) {
     const stem = token.slice(0, Math.min(token.length, 6));
     return score + (normalizedContext.includes(stem) ? 10 : 0);
   }, 0);
+}
+
+function scoreTab(value: string, normalizedContext: string) {
+  const title = normalizeText(value);
+  let score = scoreName(title, normalizedContext);
+  const contactIntent = /аккаунт|контакт|карточк|человек|имя|ссылк|созвон|встреч|лид|сделк/.test(
+    normalizedContext,
+  );
+  const outreachIntent = /рассыл|отправ|оффер|сегмент/.test(normalizedContext);
+
+  if (contactIntent && /интервью/.test(title)) score += 80;
+  if (contactIntent && /пилот|клиент/.test(title)) score += 35;
+  if (contactIntent && /сегмент.*контакт/.test(title)) score += 20;
+  if (outreachIntent && /оффер|рассыл/.test(title)) score += 80;
+  if (outreachIntent && /сегмент.*контакт/.test(title)) score += 35;
+  if (/план|дашборд/.test(title) && (contactIntent || outreachIntent)) score -= 20;
+
+  return score;
 }
 
 function normalizeText(value: string) {

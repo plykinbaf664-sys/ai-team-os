@@ -15,6 +15,7 @@ import type {
 import { executeGoogleSheetsAction } from "@/lib/executors/google-sheets-executor";
 import { executeTickTickAction } from "@/lib/executors/ticktick-executor";
 import { executeGoogleCalendarAction } from "@/lib/executors/google-calendar-executor";
+import { executeDailySummaryAction } from "@/lib/executors/daily-summary-executor";
 import { createTickTickAdapterFromEnv } from "@/lib/integrations/ticktick/ticktick-adapter";
 import {
   formatGoogleSheetsWorkspaceContext,
@@ -23,6 +24,7 @@ import {
 } from "@/lib/integrations/google-sheets/document-context";
 import { createGoogleSheetsAdapterFromEnv } from "@/lib/integrations/google-sheets/google-sheets-adapter";
 import { planAssistantMessage } from "./assistant-planner";
+import { reconcileConversationDependentActions } from "./conversation-reconciliation";
 import type { AssistantProjectContext } from "./project-context";
 import {
   attachStrategicPlan,
@@ -144,11 +146,7 @@ export async function runAssistantPipeline(
     return {
       outcome,
       results: [],
-      text: [
-        "Не удалось выполнить запрос",
-        "",
-        validation.errors.join("; "),
-      ].join("\n"),
+      text: formatFriendlyValidationError(validation.errors),
       projectContext,
     };
   }
@@ -162,7 +160,7 @@ export async function runAssistantPipeline(
     policy,
   );
   const executedResults = executablePlan
-    ? await executeActionPlan(executablePlan)
+    ? await executeActionPlan(executablePlan, { projectContext })
     : [];
   const blockedResults = createPolicyBlockedResults(
     validation.plan,
@@ -217,10 +215,19 @@ export async function createAssistantPlan(
       })) ??
       createMockActionPlan(sourceText);
 
-    const reconciled = reconcileStrategicPlanWithSheets(
+    const contextualOutcome = reconcileConversationDependentActions(
       outcome,
+      {
+        sourceText,
+        conversation,
+        timezone: projectContext?.timezone,
+      },
+    );
+    const reconciled = reconcileStrategicPlanWithSheets(
+      contextualOutcome,
       sourceText,
       googleSheetsContext.workspace,
+      { timezone: projectContext?.timezone },
     );
 
     if (reconciled.kind !== "ready") return reconciled;
@@ -559,6 +566,24 @@ export function createMockActionPlan(sourceText: string): AssistantPlanOutcome {
     };
   }
 
+  if (isDailySummaryRequest(text)) {
+    return {
+      kind: "ready",
+      plan: {
+        version: 1,
+        mode: "daily_summary",
+        sourceText: text,
+        actions: [
+          {
+            id: "action-1",
+            type: "generate_daily_summary",
+            payload: {},
+          },
+        ],
+      },
+    };
+  }
+
   if (/созда(?:й|ть)|добав(?:ь|ить)|постав(?:ь|ить)/i.test(text) && /задач/i.test(text)) {
     const task = parseCreateTask(text);
 
@@ -620,7 +645,14 @@ export function validateActionPlan(value: unknown): ActionPlanValidation {
   return { valid: true, plan: value as ActionPlan };
 }
 
-export async function executeActionPlan(plan: ActionPlan) {
+export async function executeActionPlan(
+  plan: ActionPlan,
+  {
+    projectContext,
+  }: {
+    projectContext?: AssistantProjectContext;
+  } = {},
+) {
   const results: ActionResult[] = [];
 
   for (const action of plan.actions) {
@@ -633,11 +665,18 @@ export async function executeActionPlan(plan: ActionPlan) {
       googleSheetsResult === null && tickTickResult === null
         ? await executeGoogleCalendarAction(action)
         : null;
+    const dailySummaryResult =
+      googleSheetsResult === null &&
+      tickTickResult === null &&
+      calendarResult === null
+        ? await executeDailySummaryAction(action, plan, projectContext)
+        : null;
 
     results.push(
       googleSheetsResult ??
         tickTickResult ??
         calendarResult ??
+        dailySummaryResult ??
         unsupportedActionResult(action),
     );
   }
@@ -932,6 +971,12 @@ function isTickTickTaskListRequest(text: string) {
   );
 }
 
+function isDailySummaryRequest(text: string) {
+  return /(?:дай|покажи|собери|подготовь|сделай)?\s*(?:ежедневн\w*|утренн\w*|операционн\w*)?\s*сводк|что\s+у\s+меня\s+(?:сегодня|на\s+сегодня)/iu.test(
+    text,
+  );
+}
+
 function requiresConfirmation(text: string) {
   return /удал|очист|массов|перенес[иь]\s+все|перезапиш|измени\s+структур/i.test(text);
 }
@@ -1176,6 +1221,26 @@ function requireStrings(
       errors.push(`${path}.payload.${field} is required`);
     }
   }
+}
+
+export function formatFriendlyValidationError(errors: string[]) {
+  const details = errors.join(" ").toLocaleLowerCase("ru");
+
+  if (/\.payload\.date\b/.test(details)) {
+    return "Не смог однозначно восстановить дату события. Напиши дату обычными словами — остальной контекст я подхвачу сам.";
+  }
+  if (/\.payload\.starttime\b/.test(details)) {
+    return "Не смог однозначно восстановить время начала. Напиши только время — остальной контекст я подхвачу сам.";
+  }
+  if (/\.payload\.endtime\b/.test(details)) {
+    return "Не смог однозначно восстановить время окончания. Напиши только время — остальной контекст я подхвачу сам.";
+  }
+
+  if (/append_rows|payload\.range|sheet title/.test(details)) {
+    return "Не смог безопасно определить место записи в таблице. Диапазон и номера ячеек от тебя не нужны — уточни только, что именно нужно зафиксировать.";
+  }
+
+  return "Не смог безопасно собрать действие из контекста. Повтори цель одним сообщением — технические поля, диапазоны и ID указывать не нужно.";
 }
 
 function requireSelector(

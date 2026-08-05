@@ -17,6 +17,9 @@ export type TickTickTask = {
   isAllDay?: boolean;
   priority: number;
   status: number;
+  createdTime?: string;
+  modifiedTime?: string;
+  completedTime?: string;
 };
 
 export type TickTickProjectData = {

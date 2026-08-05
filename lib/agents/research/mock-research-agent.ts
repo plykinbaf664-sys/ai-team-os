@@ -1,13 +1,13 @@
 import type {
-  AgentArtifact,
   AgentRunRequest,
+  ResearchArtifact,
 } from "../project/types";
 
 export function runMockResearchAgent(
   request: AgentRunRequest,
   artifactId: string,
   createdAt: string,
-): AgentArtifact {
+): ResearchArtifact {
   if (request.requestedBy !== "project") {
     throw new Error("Research Agent can only be started by Project Agent.");
   }
@@ -27,12 +27,20 @@ export function runMockResearchAgent(
     agentRole: "research",
     type: "research_summary",
     title: `Mock research: ${request.payload.projectGoal}`,
-    content: [
-      "Исследовательский artifact подготовлен в mock-режиме.",
-      `Цель проекта: ${request.payload.projectGoal}`,
-      `Задача исследования: ${request.payload.task}`,
-      "Фактический поиск и внешние источники не использовались.",
-    ].join("\n"),
+    content: {
+      markdown: [
+        "# Mock Research Report",
+        "",
+        "Исследовательский artifact подготовлен в mock-режиме.",
+        `Цель проекта: ${request.payload.projectGoal}`,
+        `Задача исследования: ${request.payload.task}`,
+        "Фактический поиск и внешние источники не использовались.",
+      ].join("\n"),
+      filename: "mock-research-report.md",
+      sources: [],
+      provider: "mock",
+      model: "mock",
+    },
     createdAt,
   };
 }

@@ -40,13 +40,13 @@ export const agentRegistry: Record<AgentRole, AgentDefinition> = {
   product: {
     role: "product",
     displayName: "Product Agent",
-    enabled: false,
+    enabled: true,
     canDelegate: false,
   },
   funnel: {
     role: "funnel",
     displayName: "Funnel Agent",
-    enabled: false,
+    enabled: true,
     canDelegate: false,
   },
   content: {

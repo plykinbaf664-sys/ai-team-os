@@ -342,7 +342,8 @@ async function guardEntityAppend({
   if (
     !context ||
     (context.profile.entityType !== "outreach_segment" &&
-      context.profile.entityType !== "task")
+      context.profile.entityType !== "task" &&
+      context.profile.entityType !== "contact_record")
   ) {
     return null;
   }
@@ -365,6 +366,10 @@ async function guardEntityAppend({
 
   if (!isUnambiguousRowMatch(matches, context.profile)) {
     return null;
+  }
+
+  if (context.profile.entityType === "contact_record") {
+    return `Контакт «${matches[0].entity.rowKey}» уже есть в таблице — новую строку не добавил, чтобы не создать дубль.`;
   }
 
   return `Нашёл существующую строку «${matches[0].entity.rowKey}» — новую не добавил, чтобы не создать дубль. Уточни только смысл числа: прибавить его к текущему факту или заменить текущее значение?`;
@@ -413,7 +418,7 @@ async function loadTargetSheetProfile(
     return null;
   }
 
-  const rowCount = Math.max(1, Math.min(tab.rowCount, 30));
+  const rowCount = Math.max(1, Math.min(tab.rowCount, 100));
   const columnCount = Math.max(1, Math.min(tab.columnCount, 12));
   const sampleRange = `${quoteSheetTitle(tab.title)}!A1:${columnName(columnCount - 1)}${rowCount}`;
 
