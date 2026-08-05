@@ -43,6 +43,12 @@ import {
   type TickTickMonitoringContext,
 } from "./proactive-monitor";
 import type { TickTickProject } from "@/lib/integrations/ticktick/types";
+import {
+  createDiscoveryPlan,
+  formatAssistantToolContext,
+  mergeDiscoveryPlan,
+  repairAssistantReadTargets,
+} from "./tool-loop";
 
 const ASSISTANT_MODES: AssistantMode[] = [
   "quick_command",
@@ -83,14 +89,35 @@ export type AssistantPipelineResult = {
   projectContext?: AssistantProjectContext;
 };
 
+type AssistantPlanningOptions = {
+  conversation?: AssistantConversationMessage[];
+  confirmationGranted?: boolean;
+  projectContext?: AssistantProjectContext;
+  toolContext?: string;
+};
+
+type AssistantPlanImplementation = (
+  sourceText: string,
+  options: AssistantPlanningOptions,
+) => Promise<AssistantPlanOutcome>;
+
+type AssistantExecuteImplementation = (
+  plan: ActionPlan,
+  options: { projectContext?: AssistantProjectContext },
+) => Promise<ActionResult[]>;
+
 export async function runAssistantPipeline(
   sourceText: string,
   {
     conversation = [],
     projectContext,
+    planImplementation = createAssistantPlan,
+    executeImplementation = executeActionPlan,
   }: {
     conversation?: AssistantConversationMessage[];
     projectContext?: AssistantProjectContext;
+    planImplementation?: AssistantPlanImplementation;
+    executeImplementation?: AssistantExecuteImplementation;
   } = {},
 ): Promise<AssistantPipelineResult> {
   const confirmedSourceText = resolveConfirmedRequest(
@@ -98,20 +125,76 @@ export async function runAssistantPipeline(
     conversation,
   );
   const planningSourceText = confirmedSourceText ?? sourceText;
-  const plannedOutcome = await createAssistantPlan(planningSourceText, {
+  const plannedOutcome = await planImplementation(planningSourceText, {
     conversation,
     confirmationGranted: confirmedSourceText !== null,
     projectContext,
   });
-  const outcome =
+  let outcome =
     confirmedSourceText !== null
       ? plannedOutcome
       : enforceAssistantSafety(sourceText, plannedOutcome);
+  let discoveryPlan: ActionPlan | null = null;
+  let discoveryResults: ActionResult[] = [];
+
+  if (outcome.kind === "ready") {
+    outcome = {
+      ...outcome,
+      plan: repairAssistantReadTargets(outcome.plan, projectContext),
+    };
+    discoveryPlan = createDiscoveryPlan(outcome.plan);
+
+    if (discoveryPlan) {
+      const preparedDiscovery = partitionActionPlan(discoveryPlan);
+      const executedDiscovery = preparedDiscovery.plan
+        ? await executeImplementation(preparedDiscovery.plan, {
+            projectContext,
+          })
+        : [];
+      discoveryResults = orderActionResults(discoveryPlan, [
+        ...executedDiscovery,
+        ...preparedDiscovery.invalidResults,
+      ]);
+
+      if (discoveryResults.some((result) => result.status === "succeeded")) {
+        const replanned = await planImplementation(planningSourceText, {
+          conversation,
+          confirmationGranted: confirmedSourceText !== null,
+          projectContext,
+          toolContext: formatAssistantToolContext(
+            discoveryPlan,
+            discoveryResults,
+          ),
+        });
+        outcome =
+          confirmedSourceText !== null
+            ? replanned
+            : enforceAssistantSafety(sourceText, replanned);
+
+        if (outcome.kind === "ready") {
+          outcome = {
+            ...outcome,
+            plan: {
+              ...repairAssistantReadTargets(outcome.plan, projectContext),
+              continueAfterReads: false,
+            },
+          };
+        }
+      } else {
+        return {
+          outcome: { kind: "ready", plan: discoveryPlan },
+          results: discoveryResults,
+          text: composeStrategicResponse(discoveryPlan, discoveryResults),
+          projectContext,
+        };
+      }
+    }
+  }
 
   if (outcome.kind === "response") {
     return {
       outcome,
-      results: [],
+      results: discoveryResults,
       text: outcome.text,
       projectContext,
     };
@@ -120,7 +203,7 @@ export async function runAssistantPipeline(
   if (outcome.kind === "clarification") {
     return {
       outcome,
-      results: [],
+      results: discoveryResults,
       text: outcome.question,
       projectContext,
     };
@@ -129,7 +212,7 @@ export async function runAssistantPipeline(
   if (outcome.kind === "confirmation") {
     return {
       outcome,
-      results: [],
+      results: discoveryResults,
       text: [
         "Перед выполнением нужно твоё подтверждение.",
         outcome.operationSummary,
@@ -140,46 +223,53 @@ export async function runAssistantPipeline(
     };
   }
 
-  const validation = validateActionPlan(outcome.plan);
+  const prepared = partitionActionPlan(outcome.plan);
 
-  if (!validation.valid) {
+  if (!prepared.plan) {
+    const reportedPlan = discoveryPlan
+      ? mergeDiscoveryPlan(outcome.plan, discoveryPlan)
+      : outcome.plan;
+    const results = [...discoveryResults, ...prepared.invalidResults];
     return {
-      outcome,
-      results: [],
-      text: formatFriendlyValidationError(validation.errors),
+      outcome: { kind: "ready", plan: reportedPlan },
+      results,
+      text: composeStrategicResponse(reportedPlan, results),
       projectContext,
     };
   }
 
   const policy = evaluateActionPlanPolicy(
-    validation.plan,
+    prepared.plan,
     projectContext,
   );
   const executablePlan = filterExecutableActionPlan(
-    validation.plan,
+    prepared.plan,
     policy,
   );
   const executedResults = executablePlan
-    ? await executeActionPlan(executablePlan, { projectContext })
+    ? await executeImplementation(executablePlan, { projectContext })
     : [];
   const blockedResults = createPolicyBlockedResults(
-    validation.plan,
+    prepared.plan,
     policy,
   );
-  const results = validation.plan.actions.flatMap((action) => {
-    const result = [...executedResults, ...blockedResults].find(
-      (candidate) => candidate.actionId === action.id,
-    );
-    return result ? [result] : [];
-  });
+  const finalResults = orderActionResults(outcome.plan, [
+    ...executedResults,
+    ...blockedResults,
+    ...prepared.invalidResults,
+  ]);
+  const reportedPlan = discoveryPlan
+    ? mergeDiscoveryPlan(outcome.plan, discoveryPlan)
+    : outcome.plan;
+  const results = [...discoveryResults, ...finalResults];
   const resultText = composeStrategicResponse(
-    validation.plan,
+    reportedPlan,
     results,
     policy.clarificationQuestions,
   );
 
   return {
-    outcome,
+    outcome: { kind: "ready", plan: reportedPlan },
     results,
     text: resultText,
     projectContext,
@@ -192,10 +282,12 @@ export async function createAssistantPlan(
     conversation = [],
     confirmationGranted = false,
     projectContext,
+    toolContext = "",
   }: {
     conversation?: AssistantConversationMessage[];
     confirmationGranted?: boolean;
     projectContext?: AssistantProjectContext;
+    toolContext?: string;
   } = {},
 ): Promise<AssistantPlanOutcome> {
   try {
@@ -211,7 +303,8 @@ export async function createAssistantPlan(
         tickTickProjectNames,
         googleSheetsContext: googleSheetsContext.text,
         confirmationGranted,
-        projectContext,
+          projectContext,
+          toolContext,
       })) ??
       createMockActionPlan(sourceText);
 
@@ -223,12 +316,14 @@ export async function createAssistantPlan(
         timezone: projectContext?.timezone,
       },
     );
-    const reconciled = reconcileStrategicPlanWithSheets(
-      contextualOutcome,
-      sourceText,
-      googleSheetsContext.workspace,
-      { timezone: projectContext?.timezone },
-    );
+    const reconciled = toolContext
+      ? contextualOutcome
+      : reconcileStrategicPlanWithSheets(
+          contextualOutcome,
+          sourceText,
+          googleSheetsContext.workspace,
+          { timezone: projectContext?.timezone },
+        );
 
     if (reconciled.kind !== "ready") return reconciled;
     const strategicPlan = attachStrategicPlan(
@@ -643,6 +738,80 @@ export function validateActionPlan(value: unknown): ActionPlanValidation {
   }
 
   return { valid: true, plan: value as ActionPlan };
+}
+
+export function validateAssistantAction(action: unknown) {
+  const errors: string[] = [];
+  validateAction(action, 0, errors);
+  return errors;
+}
+
+function partitionActionPlan(plan: ActionPlan): {
+  plan: ActionPlan | null;
+  invalidResults: ActionResult[];
+} {
+  const validActions: AssistantAction[] = [];
+  const invalidResults: ActionResult[] = [];
+
+  for (const action of plan.actions) {
+    const errors = validateAssistantAction(action);
+
+    if (!errors.length) {
+      validActions.push(action);
+      continue;
+    }
+
+    invalidResults.push({
+      actionId: action.id,
+      actionType: action.type,
+      status: "needs_clarification",
+      message: formatFriendlyValidationError(errors),
+      errorCode: "action_validation_failed",
+    });
+  }
+
+  if (!validActions.length) {
+    return { plan: null, invalidResults };
+  }
+
+  const candidate = { ...plan, actions: validActions };
+  const validation = validateActionPlan(candidate);
+
+  if (validation.valid) {
+    return { plan: validation.plan, invalidResults };
+  }
+
+  const deterministicCandidate: ActionPlan = {
+    ...candidate,
+    strategicPlan: undefined,
+    monitoringReport: undefined,
+  };
+  const deterministicValidation = validateActionPlan(deterministicCandidate);
+
+  if (deterministicValidation.valid) {
+    return { plan: deterministicValidation.plan, invalidResults };
+  }
+
+  return {
+    plan: null,
+    invalidResults: [
+      ...invalidResults,
+      ...validActions.map((action) => ({
+        actionId: action.id,
+        actionType: action.type,
+        status: "needs_clarification" as const,
+        message: formatFriendlyValidationError(deterministicValidation.errors),
+        errorCode: "plan_validation_failed",
+      })),
+    ],
+  };
+}
+
+function orderActionResults(plan: ActionPlan, results: ActionResult[]) {
+  return plan.actions.flatMap((action) => {
+    const result = results.find((candidate) => candidate.actionId === action.id);
+    return result ? [result] : [];
+  });
 }
 
 export async function executeActionPlan(
@@ -1091,6 +1260,11 @@ function validatePayload(
       requireSelector(payload, "taskId", "taskTitle", path, errors);
       if (!isObject(payload.changes) || !Object.keys(payload.changes).length) {
         errors.push(`${path}.payload.changes is required`);
+      } else if (
+        payload.changes.contentNote !== undefined &&
+        !isNonEmptyString(payload.changes.contentNote)
+      ) {
+        errors.push(`${path}.payload.changes.contentNote is invalid`);
       }
       break;
     case "complete_task":
@@ -1226,6 +1400,9 @@ function requireStrings(
 export function formatFriendlyValidationError(errors: string[]) {
   const details = errors.join(" ").toLocaleLowerCase("ru");
 
+  if (/\.payload\.target\b/.test(details)) {
+    return "Не смог однозначно выбрать связанную таблицу. Уточни только название документа — лист, диапазон и ID я найду сам.";
+  }
   if (/\.payload\.date\b/.test(details)) {
     return "Не смог однозначно восстановить дату события. Напиши дату обычными словами — остальной контекст я подхвачу сам.";
   }

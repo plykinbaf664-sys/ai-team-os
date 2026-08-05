@@ -92,12 +92,7 @@ export async function routeRootAgentMessage(input: {
             id: rootRunId,
             traceId,
             role: "assistant",
-            status:
-              pipeline.outcome.kind === "clarification"
-                ? "needs_clarification"
-                : pipeline.outcome.kind === "confirmation"
-                  ? "needs_confirmation"
-                  : "completed",
+            status: mapAssistantRunStatus(pipeline),
             depth: 0,
             payload: {
               source_text: input.text,
@@ -224,6 +219,36 @@ function mapActionRequestStatus(
   }
 
   return resultStatus ?? "ready";
+}
+
+function mapAssistantRunStatus(
+  pipeline: Awaited<ReturnType<typeof runAssistantPipeline>>,
+) {
+  if (pipeline.outcome.kind === "clarification") {
+    return "needs_clarification" as const;
+  }
+  if (pipeline.outcome.kind === "confirmation") {
+    return "needs_confirmation" as const;
+  }
+  if (
+    pipeline.outcome.kind === "ready" &&
+    pipeline.outcome.plan.strategicPlan?.clarification
+  ) {
+    return "needs_clarification" as const;
+  }
+  if (pipeline.results.some((result) => result.status === "needs_confirmation")) {
+    return "needs_confirmation" as const;
+  }
+  if (pipeline.results.some((result) => result.status === "needs_clarification")) {
+    return "needs_clarification" as const;
+  }
+  if (
+    pipeline.results.length > 0 &&
+    pipeline.results.every((result) => result.status === "failed")
+  ) {
+    return "failed" as const;
+  }
+  return "completed" as const;
 }
 
 function createProjectRunOutput(

@@ -78,6 +78,7 @@ export type UpdateTaskAction = Action<
     taskTitle?: string;
     changes: {
       title?: string;
+      contentNote?: string;
       dueDateText?: string;
       priority?: TaskPriority;
       project?: string;
@@ -363,6 +364,7 @@ export type ActionPlan = {
   mode: AssistantMode;
   sourceText: string;
   actions: AssistantAction[];
+  continueAfterReads?: boolean;
   strategicPlan?: StrategicActionPlan;
   monitoringReport?: ProactiveMonitoringReport;
 };
@@ -377,7 +379,30 @@ export type ActionResult = {
     | "needs_confirmation";
   message: string;
   errorCode?: string;
+  data?: AssistantToolResultData;
 };
+
+export type AssistantToolResultData =
+  | {
+      kind: "ticktick_tasks";
+      tasks: Array<{
+        id: string;
+        projectId: string;
+        projectName: string;
+        title: string;
+        content?: string;
+        dueDate?: string;
+        timeZone?: string;
+        priority: number;
+      }>;
+    }
+  | {
+      kind: "sheet_range";
+      spreadsheetId: string;
+      spreadsheetTitle: string;
+      range: string;
+      values: SheetCellValue[][];
+    };
 
 export type ClarificationRequest = {
   kind: "clarification";

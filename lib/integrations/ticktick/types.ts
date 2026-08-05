@@ -41,6 +41,7 @@ export type TickTickUpdateTaskInput = {
   id: string;
   projectId: string;
   title: string;
+  content?: string;
   dueDate?: string;
   timeZone?: string;
   isAllDay?: boolean;

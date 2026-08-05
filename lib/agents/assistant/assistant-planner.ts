@@ -29,6 +29,7 @@ type PlannerWireOutcome = {
   reason: string | null;
   operationSummary: string | null;
   responseText: string | null;
+  continueAfterReads?: boolean;
   strategicPlan?: unknown;
 };
 
@@ -324,9 +325,10 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                   {
                     type: "object",
                     additionalProperties: false,
-                    properties: {
-                      title: NULLABLE_STRING,
-                      dueDateText: NULLABLE_STRING,
+                      properties: {
+                        title: NULLABLE_STRING,
+                        contentNote: NULLABLE_STRING,
+                        dueDateText: NULLABLE_STRING,
                       priority: {
                         anyOf: [
                           {
@@ -342,9 +344,10 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                       endTime: NULLABLE_STRING,
                       timezone: NULLABLE_STRING,
                     },
-                    required: [
-                      "title",
-                      "dueDateText",
+                      required: [
+                        "title",
+                        "contentNote",
+                        "dueDateText",
                       "priority",
                       "project",
                       "date",
@@ -524,9 +527,16 @@ const STRICT_PLANNER_SCHEMA: Record<string, unknown> = {
             },
             mode: { type: "string", enum: MODES },
             actions: READY_ACTIONS_SCHEMA,
+            continueAfterReads: { type: "boolean" },
             strategicPlan: STRATEGIC_PLAN_SCHEMA,
           },
-          required: ["kind", "mode", "actions", "strategicPlan"],
+          required: [
+            "kind",
+            "mode",
+            "actions",
+            "continueAfterReads",
+            "strategicPlan",
+          ],
         },
         {
           type: "object",
@@ -576,6 +586,10 @@ const PLANNER_INSTRUCTIONS = [
   "Assistant работает с личными задачами, календарём, метриками и Google Sheets.",
   "Он никогда не вызывает Project Agent или специализированных агентов.",
   "Если пользователь просит найти таблицу по точному названию — find_sheet.",
+  "Ты работаешь в ограниченном tool loop. Если для изменения сначала нужно найти существующую задачу, строку или другой внешний объект, на первом проходе верни только безопасные read actions и continueAfterReads=true.",
+  "Если пользователь просит только показать или прочитать данные, поставь continueAfterReads=false. После получения блока «Результаты инструментов» сформируй конечные write actions либо один действительно необходимый вопрос и всегда поставь continueAfterReads=false.",
+  "Не угадывай ID и координаты: используй точные taskId, spreadsheetId, диапазоны и значения из результатов инструментов.",
+  "Когда нужно найти существующую задачу перед изменением, используй list_tasks с limit=50, чтобы ближайшая задача не потерялась среди просроченных.",
   "Если просит увидеть структуру, содержимое или посмотреть таблицу — read_sheet. Название после слов «называется», «на Google Drive» или в кавычках является target title.",
   "Если в одном запросе есть и «найти», и просьба увидеть/посмотреть структуру или содержимое, всегда выбирай read_sheet: оно само найдёт таблицу по title.",
   "Фразы «видишь ли ты структуру таблицы X?» и «можешь посмотреть таблицу X?» — это команды read_sheet, а не вопросы о возможностях. Не отвечай response и не говори, что доступа нет: доступ проверит исполнитель.",
@@ -603,6 +617,7 @@ const PLANNER_INSTRUCTIONS = [
   "Если не хватает обязательных фактов, используй clarification. Задай столько конкретных вопросов, сколько действительно нужно для качественного выполнения; независимые вопросы можно объединить. Не спрашивай повторно то, что уже есть в контексте.",
   "Не выдумывай даты, время, проект, сумму, статус или человека. Естественный срок задачи можно дословно сохранить в dueDateText.",
   "Для действий TickTick выбирай project только из переданного списка доступных проектов и возвращай его точное название.",
+  "Для пометки, комментария или операционной заметки в существующей задаче используй update_task.changes.contentNote. Это заметка для добавления к существующему описанию, а не полная замена content.",
   "Определяй проект по текущему запросу и истории беседы. Если контекст уверенно указывает на один проект — выбери его. Если подходят несколько или данных недостаточно — используй clarification.",
   "Runtime может передать типизированный Project Context. Если resolution=resolved, используй активный проект, его связанные ресурсы, glossary и правила; не спрашивай название проекта или таблицы повторно.",
   "Если Project Context ambiguous, задавай вопрос о проекте только когда без проекта небезопасно выполнить текущее действие. Если однозначную часть можно выполнить отдельно — выполни её.",
@@ -675,6 +690,7 @@ export async function planAssistantMessage(
     googleSheetsContext = "",
     confirmationGranted = false,
     projectContext,
+    toolContext = "",
   }: {
     apiKey?: string;
     model?: string;
@@ -684,6 +700,7 @@ export async function planAssistantMessage(
     googleSheetsContext?: string;
     confirmationGranted?: boolean;
     projectContext?: AssistantProjectContext;
+    toolContext?: string;
   } = {},
 ): Promise<AssistantPlanOutcome | null> {
   if (!apiKey) {
@@ -701,6 +718,7 @@ export async function planAssistantMessage(
       googleSheetsContext,
       confirmationGranted,
       projectContext,
+      toolContext,
     ),
     schemaName: "assistant_plan_outcome",
     schema: STRICT_PLANNER_SCHEMA,
@@ -717,6 +735,7 @@ function buildPlannerInput(
   googleSheetsContext: string,
   confirmationGranted: boolean,
   projectContext?: AssistantProjectContext,
+  toolContext = "",
 ) {
   const recentConversation = conversation
     .filter(
@@ -740,6 +759,7 @@ function buildPlannerInput(
     !projects.length &&
     !googleSheetsContext &&
     !projectContextText &&
+    !toolContext &&
     !confirmationGranted
   ) {
     return sourceText;
@@ -768,6 +788,12 @@ function buildPlannerInput(
       ? [
           "Контекст Google Sheets, полученный runtime через безопасное чтение:",
           googleSheetsContext,
+        ].join("\n")
+      : "",
+    toolContext
+      ? [
+          "Результаты инструментов текущего запроса. Используй их как данные для конечного плана:",
+          toolContext,
         ].join("\n")
       : "",
     confirmationGranted
@@ -849,6 +875,7 @@ function normalizePlannerOutcome(
       mode: wire.mode as AssistantMode,
       sourceText,
       actions,
+      continueAfterReads: wire.continueAfterReads === true,
       strategicPlan: normalizeStrategicActionPlan(wire.strategicPlan, {
         sourceText,
         actions,

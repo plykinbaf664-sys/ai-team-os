@@ -140,6 +140,7 @@ async function executeListTasks(
       action.payload.project
         ? `В проекте «${action.payload.project}» открытых задач нет.`
         : "Открытых задач в TickTick не найдено.",
+      { kind: "ticktick_tasks", tasks: [] },
     );
   }
 
@@ -156,7 +157,19 @@ async function executeListTasks(
     lines.push("", `Показаны первые ${limit} задач.`);
   }
 
-  return success(action, lines.join("\n"));
+  return success(action, lines.join("\n"), {
+    kind: "ticktick_tasks",
+    tasks: tasks.map(({ project, task }) => ({
+      id: task.id,
+      projectId: project.id,
+      projectName: project.name,
+      title: task.title,
+      ...(task.content ? { content: task.content.slice(0, 500) } : {}),
+      ...(task.dueDate ? { dueDate: task.dueDate } : {}),
+      ...(task.timeZone ? { timeZone: task.timeZone } : {}),
+      priority: task.priority,
+    })),
+  });
 }
 
 function compareTasks(left: LocatedTask, right: LocatedTask) {
@@ -280,7 +293,7 @@ async function executeCreateTask(
       ? {
           dueDate: dueDate.dueDate,
           timeZone: dueDate.timeZone,
-          isAllDay: true,
+          isAllDay: dueDate.isAllDay ?? true,
         }
       : {}),
   });
@@ -363,10 +376,18 @@ async function executeUpdateTask(
     });
   }
 
+  const nextContent = action.payload.changes.contentNote
+    ? appendTaskNote(
+        located.task.content,
+        action.payload.changes.contentNote,
+      )
+    : located.task.content;
+
   const updated = await adapter.updateTask({
     id: located.task.id,
     projectId: destination.projectId,
     title: action.payload.changes.title?.trim() || located.task.title,
+    ...(nextContent !== undefined ? { content: nextContent } : {}),
     priority:
       action.payload.changes.priority === undefined
         ? normalizeTickTickPriority(located.task.priority)
@@ -381,14 +402,30 @@ async function executeUpdateTask(
         : located.task.timeZone,
     isAllDay:
       dueDate.kind === "resolved"
-        ? true
+        ? dueDate.isAllDay ?? true
         : located.task.isAllDay,
   });
 
   return success(
     action,
-    `Задача обновлена в TickTick, список «${destination.projectName}»: ${updated.title}.`,
+    [
+      `Задача обновлена в TickTick, список «${destination.projectName}»: ${updated.title}.`,
+      action.payload.changes.contentNote ? "Заметка добавлена." : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
   );
+}
+
+function appendTaskNote(current: string | undefined, note: string) {
+  const normalizedNote = note.trim();
+  const normalizedCurrent = current?.trim() ?? "";
+
+  if (!normalizedNote || normalizedCurrent.includes(normalizedNote)) {
+    return normalizedCurrent || undefined;
+  }
+
+  return [normalizedCurrent, normalizedNote].filter(Boolean).join("\n\n");
 }
 
 async function executeCompleteTask(
@@ -556,6 +593,7 @@ export function resolveTaskDueDate(
       kind: "resolved";
       dueDate: string;
       timeZone: string;
+      isAllDay?: false;
     }
   | { kind: "invalid"; message: string } {
   if (!dueDateText?.trim()) {
@@ -581,6 +619,9 @@ export function resolveTaskDueDate(
   const normalized = dueDateText.trim().toLowerCase();
   const isoDate = normalized.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   const ruDate = normalized.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+  const namedDate = normalized.match(
+    /\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?\b/u,
+  );
   let date: Date | null = null;
 
   if (isoDate) {
@@ -594,6 +635,12 @@ export function resolveTaskDueDate(
       Number(ruDate[3]),
       Number(ruDate[2]),
       Number(ruDate[1]),
+    );
+  } else if (namedDate) {
+    date = createUtcDate(
+      namedDate[3] ? Number(namedDate[3]) : localDate.getUTCFullYear(),
+      russianMonth(namedDate[2]),
+      Number(namedDate[1]),
     );
   } else if (/\bпослезавтра\b/u.test(normalized)) {
     date = addDays(localDate, 2);
@@ -623,11 +670,112 @@ export function resolveTaskDueDate(
     };
   }
 
+  const time = extractClockTime(normalized);
+
+  if (time) {
+    const instant = localDateTimeToUtc(
+      date.getUTCFullYear(),
+      date.getUTCMonth() + 1,
+      date.getUTCDate(),
+      time.hour,
+      time.minute,
+      timezone,
+    );
+
+    if (!instant) {
+      return {
+        kind: "invalid",
+        message: "Не удалось определить локальное время дедлайна.",
+      };
+    }
+
+    return {
+      kind: "resolved",
+      dueDate: `${formatDate(instant)}T${String(instant.getUTCHours()).padStart(2, "0")}:${String(instant.getUTCMinutes()).padStart(2, "0")}:00+0000`,
+      timeZone: timezone,
+      isAllDay: false,
+    };
+  }
+
   return {
     kind: "resolved",
     dueDate: `${formatDate(date)}T00:00:00+0000`,
     timeZone: timezone,
   };
+}
+
+function extractClockTime(value: string) {
+  const match = value.match(
+    /(?:\bв\s+([01]?\d|2[0-3])[.:]([0-5]\d)\b)|(?:\b([01]?\d|2[0-3]):([0-5]\d)\b)/u,
+  );
+  const hour = Number(match?.[1] ?? match?.[3]);
+  const minute = Number(match?.[2] ?? match?.[4]);
+
+  return Number.isInteger(hour) && Number.isInteger(minute)
+    ? { hour, minute }
+    : null;
+}
+
+function localDateTimeToUtc(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  timezone: string,
+) {
+  const target = Date.UTC(year, month - 1, day, hour, minute);
+  let instant = target;
+
+  try {
+    for (let iteration = 0; iteration < 3; iteration += 1) {
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(new Date(instant));
+      const values = Object.fromEntries(
+        parts
+          .filter((part) => part.type !== "literal")
+          .map((part) => [part.type, Number(part.value)]),
+      );
+      const represented = Date.UTC(
+        values.year,
+        values.month - 1,
+        values.day,
+        values.hour,
+        values.minute,
+      );
+      instant -= represented - target;
+    }
+
+    return new Date(instant);
+  } catch {
+    return null;
+  }
+}
+
+function russianMonth(value: string) {
+  const months: Record<string, number> = {
+    января: 1,
+    февраля: 2,
+    марта: 3,
+    апреля: 4,
+    мая: 5,
+    июня: 6,
+    июля: 7,
+    августа: 8,
+    сентября: 9,
+    октября: 10,
+    ноября: 11,
+    декабря: 12,
+  };
+
+  return months[value] ?? 0;
 }
 
 function getLocalDate(now: Date, timezone: string) {
@@ -732,12 +880,17 @@ function isTickTickAction(action: AssistantAction): action is TickTickAction {
   );
 }
 
-function success(action: TickTickAction, message: string): ActionResult {
+function success(
+  action: TickTickAction,
+  message: string,
+  data?: ActionResult["data"],
+): ActionResult {
   return {
     actionId: action.id,
     actionType: action.type,
     status: "succeeded",
     message,
+    ...(data ? { data } : {}),
   };
 }
 

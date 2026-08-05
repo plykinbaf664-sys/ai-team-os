@@ -136,6 +136,13 @@ export async function executeGoogleSheetsAction(
             formatRangeValues(range.values),
             resolved.metadata.spreadsheetUrl,
           ].join("\n"),
+          {
+            kind: "sheet_range",
+            spreadsheetId: resolved.metadata.spreadsheetId,
+            spreadsheetTitle: resolved.metadata.title,
+            range: range.range,
+            values: range.values,
+          },
         );
       }
 
@@ -577,12 +584,14 @@ function formatRangeValues(
 function success(
   action: GoogleSheetsAction,
   message: string,
+  data?: ActionResult["data"],
 ): ActionResult {
   return {
     actionId: action.id,
     actionType: action.type,
     status: "succeeded",
     message,
+    ...(data ? { data } : {}),
   };
 }
 
