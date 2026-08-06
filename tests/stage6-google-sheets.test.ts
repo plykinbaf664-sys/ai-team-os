@@ -335,6 +335,50 @@ test("reads metadata and a bounded range from an existing spreadsheet", async ()
   assert.match(urls[2], /valueRenderOption=FORMATTED_VALUE/);
 });
 
+test("bounds an unbounded analytical read without asking for coordinates", async () => {
+  let requestedRange = "";
+  const adapter = fakeSheetsAdapter({
+    getSpreadsheetMetadata: async () => ({
+      spreadsheetId: "materials-sheet",
+      spreadsheetUrl: "https://example.com/materials-sheet",
+      title: "Мои материалы",
+      tabs: [
+        {
+          sheetId: 1,
+          title: "01 СКРЫТЫЕ ДЕНЬГИ",
+          rowCount: 300,
+          columnCount: 12,
+          frozenRowCount: 1,
+          frozenColumnCount: 0,
+        },
+      ],
+    }),
+    readRange: async ({ spreadsheetId, range }) => {
+      requestedRange = range;
+      return {
+        spreadsheetId,
+        range,
+        values: [["Приоритет", "Деньги"]],
+      };
+    },
+  });
+
+  const result = await executeGoogleSheetsAction(
+    {
+      id: "read-analytics",
+      type: "read_sheet",
+      payload: {
+        target: { kind: "id", spreadsheetId: "materials-sheet" },
+        range: "'01 СКРЫТЫЕ ДЕНЬГИ'!A:L",
+      },
+    },
+    adapter,
+  );
+
+  assert.equal(result?.status, "succeeded");
+  assert.equal(requestedRange, "'01 СКРЫТЫЕ ДЕНЬГИ'!A1:L41");
+});
+
 test("reads formula and protected-column metadata for a sheet profile", async () => {
   const urls: string[] = [];
   const responses = [

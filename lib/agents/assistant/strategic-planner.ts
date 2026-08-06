@@ -119,6 +119,7 @@ export function reconcileStrategicPlanWithSheets(
   } = {},
 ): AssistantPlanOutcome {
   if (outcome.kind !== "ready" || !workspace) return outcome;
+  outcome = reconcileSheetReadTargets(outcome, sourceText, workspace);
   const contactOutcome = reconcileContactRecord(
     outcome,
     sourceText,
@@ -273,6 +274,82 @@ export function reconcileStrategicPlanWithSheets(
       },
     },
   };
+}
+
+function reconcileSheetReadTargets(
+  outcome: Extract<AssistantPlanOutcome, { kind: "ready" }>,
+  sourceText: string,
+  workspace: GoogleSheetsWorkspaceContext,
+): Extract<AssistantPlanOutcome, { kind: "ready" }> {
+  const normalizedSource = normalizeResourceName(sourceText);
+  const explicitlyMentionedDocuments = workspace.inspectedDocuments.filter(
+    (document) =>
+      normalizedSource.includes(normalizeResourceName(document.title)),
+  );
+
+  const actions = outcome.plan.actions.map((action) => {
+    if (action.type !== "read_sheet" || !action.payload.range) {
+      return action;
+    }
+
+    const sheetName = extractRangeSheetName(action.payload.range);
+    if (!sheetName) return action;
+
+    const documentsWithTab = workspace.inspectedDocuments.filter((document) =>
+      document.tabs.some(
+        (tab) =>
+          normalizeResourceName(tab.title) ===
+          normalizeResourceName(sheetName),
+      ),
+    );
+    const explicitlyMentionedMatches = explicitlyMentionedDocuments.filter(
+      (document) => documentsWithTab.includes(document),
+    );
+    const candidates = explicitlyMentionedMatches.length
+      ? explicitlyMentionedMatches
+      : documentsWithTab;
+
+    if (candidates.length !== 1) return action;
+
+    return {
+      ...action,
+      payload: {
+        ...action.payload,
+        target: {
+          kind: "id" as const,
+          spreadsheetId: candidates[0].spreadsheetId,
+        },
+      },
+    };
+  });
+
+  return {
+    ...outcome,
+    plan: {
+      ...outcome.plan,
+      actions,
+    },
+  };
+}
+
+function extractRangeSheetName(range: string) {
+  const separatorIndex = range.indexOf("!");
+  if (separatorIndex < 1) return "";
+
+  return range
+    .slice(0, separatorIndex)
+    .trim()
+    .replace(/^'(.*)'$/u, "$1")
+    .replace(/''/g, "'");
+}
+
+function normalizeResourceName(value: string) {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase("ru")
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
 }
 
 function reconcileContactRecord(

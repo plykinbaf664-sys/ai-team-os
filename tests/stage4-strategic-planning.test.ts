@@ -200,6 +200,86 @@ test("fallback strategic plan uses the resolved project and linked resource", ()
   assert.equal(enriched.strategicPlan?.actions[0].executionPolicy, "auto_execute");
 });
 
+test("analytics reads always continue into an evidence-based planning pass", async () => {
+  const outcome = await planAssistantMessage(
+    "Проанализируй таблицу и покажи узкие места",
+    {
+      apiKey: "test-key",
+      fetchImplementation: (async () =>
+        Response.json({
+          status: "completed",
+          output_text: JSON.stringify({
+            outcome: {
+              kind: "ready",
+              mode: "analytics",
+              actions: [
+                {
+                  id: "read-1",
+                  type: "read_sheet",
+                  payload: {
+                    target: { kind: "title", title: "Мои материалы" },
+                    range: "'01 СКРЫТЫЕ ДЕНЬГИ'!A1:L40",
+                  },
+                },
+              ],
+              continueAfterReads: false,
+              strategicPlan: null,
+            },
+          }),
+        })) as typeof fetch,
+    },
+  );
+
+  assert.equal(outcome?.kind, "ready");
+  if (!outcome || outcome.kind !== "ready") return;
+  assert.equal(outcome.plan.continueAfterReads, true);
+});
+
+test("keeps an explicitly named document separate from its tab", () => {
+  const plan: ActionPlan = {
+    version: 1,
+    mode: "analytics",
+    sourceText: "Проанализируй таблицу «Мои материалы»",
+    actions: [
+      {
+        id: "read-1",
+        type: "read_sheet",
+        payload: {
+          target: { kind: "title", title: "01 СКРЫТЫЕ ДЕНЬГИ" },
+          range: "'01 СКРЫТЫЕ ДЕНЬГИ'!A1:L40",
+        },
+      },
+    ],
+  };
+  const workspace = {
+    availableDocuments: [],
+    inspectedDocuments: [
+      {
+        spreadsheetId: "materials-sheet",
+        title: "Мои материалы",
+        spreadsheetUrl: "https://example.com/materials-sheet",
+        tabs: [{ title: "01 СКРЫТЫЕ ДЕНЬГИ" }],
+      },
+    ],
+  } as unknown as GoogleSheetsWorkspaceContext;
+
+  const reconciled = reconcileStrategicPlanWithSheets(
+    { kind: "ready", plan },
+    plan.sourceText,
+    workspace,
+  );
+
+  assert.equal(reconciled.kind, "ready");
+  if (reconciled.kind !== "ready") return;
+  const action = reconciled.plan.actions[0];
+  assert.equal(action.type, "read_sheet");
+  if (action.type !== "read_sheet") return;
+  assert.deepEqual(action.payload.target, {
+    kind: "id",
+    spreadsheetId: "materials-sheet",
+  });
+});
+
 test("deterministic reconciliation replaces an invented tab with the matched row", () => {
   const basePlan: ActionPlan = {
     version: 1,

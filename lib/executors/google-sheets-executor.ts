@@ -59,6 +59,8 @@ type SheetResolution =
       matches: ExistingSpreadsheetSummary[];
     };
 
+const MAX_SAFE_READ_CELLS = 500;
+
 export async function executeGoogleSheetsAction(
   action: AssistantAction,
   adapterOverride?: GoogleSheetsAdapter | null,
@@ -124,9 +126,13 @@ export async function executeGoogleSheetsAction(
           );
         }
 
+        const safeRange = resolveSafeReadRange(
+          resolved.metadata,
+          action.payload.range,
+        );
         const range = await adapter.readRange({
           spreadsheetId: resolved.metadata.spreadsheetId,
-          range: action.payload.range,
+          range: safeRange,
         });
 
         return success(
@@ -462,6 +468,49 @@ function extractSheetTitle(range: string) {
   return rawTitle.startsWith("'") && rawTitle.endsWith("'")
     ? rawTitle.slice(1, -1).replace(/''/g, "'")
     : rawTitle;
+}
+
+function resolveSafeReadRange(
+  metadata: ExistingSpreadsheetMetadata,
+  range: string,
+) {
+  const separatorIndex = range.indexOf("!");
+  if (separatorIndex < 1) return range;
+
+  const cellRange = range.slice(separatorIndex + 1).trim();
+  const unboundedColumns = cellRange.match(
+    /^\$?([A-Z]{1,3}):\$?([A-Z]{1,3})$/iu,
+  );
+  if (!unboundedColumns) return range;
+
+  const sheetName = extractSheetTitle(range);
+  const tab = metadata.tabs.find(
+    (candidate) =>
+      candidate.title.localeCompare(sheetName, undefined, {
+        sensitivity: "base",
+      }) === 0,
+  );
+  if (!tab) return range;
+
+  const startColumnIndex = columnIndex(unboundedColumns[1]);
+  const endColumnIndex = columnIndex(unboundedColumns[2]);
+  if (startColumnIndex > endColumnIndex) return range;
+
+  const columnCount = endColumnIndex - startColumnIndex + 1;
+  const maxRows = Math.max(
+    1,
+    Math.min(tab.rowCount, Math.floor(MAX_SAFE_READ_CELLS / columnCount)),
+  );
+
+  return `${quoteSheetTitle(tab.title)}!${unboundedColumns[1].toUpperCase()}1:${unboundedColumns[2].toUpperCase()}${maxRows}`;
+}
+
+function columnIndex(column: string) {
+  return [...column.toUpperCase()].reduce(
+    (result, character) =>
+      result * 26 + character.charCodeAt(0) - 64,
+    0,
+  );
 }
 
 function quoteSheetTitle(title: string) {

@@ -107,6 +107,63 @@ test("bounded tool loop reads, replans once and executes grounded updates", asyn
   assert.match(result.text, /На какую новую дату и время перенести созвон/iu);
 });
 
+test("analytical reads return a grounded strategic answer after replanning", async () => {
+  let planningCalls = 0;
+  const result = await runAssistantPipeline(
+    "Проанализируй таблицу «Мои материалы» и дай короткий план",
+    {
+      planImplementation: async (_text, options) => {
+        planningCalls += 1;
+        if (!options.toolContext) {
+          return {
+            kind: "ready",
+            plan: {
+              version: 1,
+              mode: "analytics",
+              sourceText: "Проанализируй таблицу",
+              continueAfterReads: true,
+              actions: [
+                {
+                  id: "read-money",
+                  type: "read_sheet",
+                  payload: {
+                    target: { kind: "id", spreadsheetId: "materials-sheet" },
+                    range: "'01 СКРЫТЫЕ ДЕНЬГИ'!A1:L40",
+                  },
+                },
+              ],
+            },
+          };
+        }
+
+        assert.match(options.toolContext, /Тёплый лид/u);
+        return {
+          kind: "response",
+          text: "Фокус: сначала дожать тёплые лиды. 1. Связаться с тремя контактами.",
+        };
+      },
+      executeImplementation: async (plan) =>
+        plan.actions.map((action) => ({
+          actionId: action.id,
+          actionType: action.type,
+          status: "succeeded" as const,
+          message: "Данные прочитаны.",
+          data: {
+            kind: "sheet_range" as const,
+            spreadsheetId: "materials-sheet",
+            spreadsheetTitle: "Мои материалы",
+            range: "'01 СКРЫТЫЕ ДЕНЬГИ'!A1:L40",
+            values: [["Приоритет", "Состояние"], ["Тёплый лид", "Готов к контакту"]],
+          },
+        })),
+    },
+  );
+
+  assert.equal(planningCalls, 2);
+  assert.match(result.text, /дожать тёплые лиды/u);
+  assert.equal(result.results[0].status, "succeeded");
+});
+
 test("one malformed read action no longer blocks an independent valid action", async () => {
   let executedTypes: string[] = [];
   const malformedPlan = {
