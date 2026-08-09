@@ -133,6 +133,99 @@ test("inspects the explicitly mentioned spreadsheet before unrelated documents",
   assert.match(formatted, /Дата \| Сегмент \| Количество/);
 });
 
+test("strategic discovery loads tab metadata without spending range-read quota", async () => {
+  let rangeReads = 0;
+  const adapter = fakeSheetsAdapter({
+    listSpreadsheets: async () => [
+      {
+        spreadsheetId: "materials",
+        spreadsheetUrl: "https://example.com/materials",
+        title: "Мои материалы",
+      },
+    ],
+    getSpreadsheetMetadata: async () => ({
+      spreadsheetId: "materials",
+      spreadsheetUrl: "https://example.com/materials",
+      title: "Мои материалы",
+      tabs: Array.from({ length: 12 }, (_, index) => ({
+        sheetId: index + 1,
+        title: index === 11 ? "12 СТРАТЕГИЯ ПРОДАЖ" : `Лист ${index + 1}`,
+        rowCount: 200,
+        columnCount: 12,
+        frozenRowCount: 1,
+        frozenColumnCount: 0,
+      })),
+    }),
+    readRange: async () => {
+      rangeReads += 1;
+      throw new Error("metadata-only inspection must not read values");
+    },
+  });
+
+  const context = await inspectGoogleSheetsWorkspace({
+    adapter,
+    sourceText: "Проанализируй таблицу Мои материалы и найди быстрые деньги",
+    metadataOnly: true,
+  });
+  const formatted = formatGoogleSheetsWorkspaceContext(context);
+
+  assert.equal(rangeReads, 0);
+  assert.equal(context.inspectedDocuments[0].tabs.length, 12);
+  assert.match(formatted, /12 СТРАТЕГИЯ ПРОДАЖ/u);
+});
+
+test("strategic discovery prefers linked and user-mentioned documents", async () => {
+  const metadataCalls: string[] = [];
+  const documents = [
+    { spreadsheetId: "tasks", title: "Задачи" },
+    { spreadsheetId: "launch", title: "Запуск магазина ИИ-агентов — 90 дней" },
+    { spreadsheetId: "materials", title: "Мои материалы" },
+  ];
+  const adapter = fakeSheetsAdapter({
+    listSpreadsheets: async () =>
+      documents.map((document) => ({
+        ...document,
+        spreadsheetUrl: `https://example.com/${document.spreadsheetId}`,
+      })),
+    getSpreadsheetMetadata: async (spreadsheetId) => {
+      metadataCalls.push(spreadsheetId);
+      const document = documents.find(
+        (candidate) => candidate.spreadsheetId === spreadsheetId,
+      );
+      if (!document) throw new Error("unknown document");
+      return {
+        ...document,
+        spreadsheetUrl: `https://example.com/${spreadsheetId}`,
+        tabs: [
+          {
+            sheetId: 1,
+            title: "ДАШБОРД",
+            rowCount: 100,
+            columnCount: 12,
+            frozenRowCount: 1,
+            frozenColumnCount: 0,
+          },
+        ],
+      };
+    },
+  });
+
+  await inspectGoogleSheetsWorkspace({
+    adapter,
+    sourceText: "Проанализируй мои таблицы и найди путь к первой оплате",
+    conversation: [
+      {
+        role: "user",
+        text: "Сопоставь Мои материалы с данными запуска.",
+      },
+    ],
+    preferredSpreadsheetIds: ["launch"],
+    metadataOnly: true,
+  });
+
+  assert.deepEqual(metadataCalls, ["launch", "materials"]);
+});
+
 test("appends through the values API instead of the physical sheet bottom", async () => {
   const calls: Array<{ url: string; method: string; body?: unknown }> = [];
   const responses = [

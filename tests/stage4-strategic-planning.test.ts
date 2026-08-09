@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { planAssistantMessage } from "../lib/agents/assistant/assistant-planner";
-import { shouldInspectGoogleSheets } from "../lib/agents/assistant/assistant-core";
+import {
+  enforceAssistantSafety,
+  groundReadActionsToWorkspace,
+  shouldInspectGoogleSheets,
+} from "../lib/agents/assistant/assistant-core";
 import type { AssistantProjectContext } from "../lib/agents/assistant/project-context";
 import {
   attachStrategicPlan,
@@ -176,6 +180,9 @@ test("forms a strategic plan for the outreach update", async () => {
   assert.equal(outcome?.kind, "ready");
   if (!outcome || outcome.kind !== "ready") return;
   assert.match(requestBody, /strategicPlan/);
+  assert.match(requestBody, /готовое управленческое решение/u);
+  assert.match(requestBody, /Адаптируй длину и форму/u);
+  assert.match(requestBody, /Не показывай без прямого запроса номера строк/u);
   assert.equal(outcome.plan.strategicPlan?.projectId, "launch");
   assert.equal(outcome.plan.strategicPlan?.targetResources[0].rowNumber, 11);
   assert.equal(outcome.plan.strategicPlan?.actions[0].linkedActionId, "action-1");
@@ -233,6 +240,241 @@ test("analytics reads always continue into an evidence-based planning pass", asy
   assert.equal(outcome?.kind, "ready");
   if (!outcome || outcome.kind !== "ready") return;
   assert.equal(outcome.plan.continueAfterReads, true);
+});
+
+test("six safe analytical reads never require mass-operation confirmation", () => {
+  const sourceText =
+    "Проанализируй мои таблицы и разложи стратегию получения первой оплаты.";
+  const outcome = enforceAssistantSafety(sourceText, {
+    kind: "ready",
+    plan: {
+      version: 1,
+      mode: "analytics",
+      sourceText,
+      continueAfterReads: true,
+      actions: Array.from({ length: 6 }, (_, index) => ({
+        id: `read-${index + 1}`,
+        type: "read_sheet" as const,
+        payload: {
+          target: {
+            kind: "id" as const,
+            spreadsheetId: `sheet-${index + 1}`,
+          },
+          range: `'Лист ${index + 1}'!A1:L50`,
+        },
+      })),
+    },
+  });
+
+  assert.equal(outcome.kind, "ready");
+});
+
+test("grounds strategic ranges to real tabs and the 500-cell read limit", () => {
+  const sourceText = "Проанализируй таблицы и найди путь к первой оплате";
+  const outcome = groundReadActionsToWorkspace(
+    {
+      kind: "ready",
+      plan: {
+        version: 1,
+        mode: "analytics",
+        sourceText,
+        continueAfterReads: true,
+        actions: [
+          {
+            id: "read-plan",
+            type: "read_sheet",
+            payload: {
+              target: { kind: "id", spreadsheetId: "launch" },
+              range: "'План'!A1:L50",
+            },
+          },
+          {
+            id: "read-leads",
+            type: "read_sheet",
+            payload: {
+              target: { kind: "id", spreadsheetId: "materials" },
+              range: "'Лиды'!A1:L50",
+            },
+          },
+        ],
+      },
+    },
+    {
+      availableDocuments: [],
+      inspectedDocuments: [
+        {
+          spreadsheetId: "launch",
+          title: "Запуск магазина ИИ-агентов — 90 дней",
+          spreadsheetUrl: "https://example.com/launch",
+          tabs: [{ title: "ПЛАН НА 90 ДНЕЙ" }],
+        },
+        {
+          spreadsheetId: "materials",
+          title: "Мои материалы",
+          spreadsheetUrl: "https://example.com/materials",
+          tabs: [{ title: "Лиды" }],
+        },
+      ],
+    } as unknown as GoogleSheetsWorkspaceContext,
+  );
+
+  assert.equal(outcome.kind, "ready");
+  if (outcome.kind !== "ready") return;
+  assert.deepEqual(
+    outcome.plan.actions.map((action) =>
+      action.type === "read_sheet" ? action.payload.range : null,
+    ),
+    ["'ПЛАН НА 90 ДНЕЙ'!A1:L41", "'Лиды'!A1:L41"],
+  );
+});
+
+test("uses a lightweight discovery schema for a cross-document strategy request", async () => {
+  let requestBody = "";
+  const outcome = await planAssistantMessage(
+    "Проанализируй таблицы Мои материалы и Запуск магазина. Найди быстрые деньги и дай план действий.",
+    {
+      apiKey: "test-key",
+      googleSheetsContext: [
+        "Документ: Мои материалы",
+        "spreadsheet_id: materials",
+        "Лист: 01 СКРЫТЫЕ ДЕНЬГИ",
+        "Документ: Запуск магазина ИИ-агентов — 90 дней",
+        "spreadsheet_id: launch",
+        "Лист: ДАШБОРД",
+      ].join("\n"),
+      fetchImplementation: (async (_input, init) => {
+        requestBody = String(init?.body ?? "");
+        return Response.json({
+          status: "completed",
+          output_text: JSON.stringify({
+            reads: [
+              {
+                spreadsheetId: "materials",
+                range: "'01 СКРЫТЫЕ ДЕНЬГИ'!A1:L200",
+              },
+              {
+                spreadsheetId: "launch",
+                range: "'ДАШБОРД'!A1:L200",
+              },
+            ],
+          }),
+        });
+      }) as typeof fetch,
+    },
+  );
+
+  assert.equal(outcome?.kind, "ready");
+  if (!outcome || outcome.kind !== "ready") return;
+  assert.equal(outcome.plan.mode, "analytics");
+  assert.equal(outcome.plan.continueAfterReads, true);
+  assert.deepEqual(
+    outcome.plan.actions.map((action) =>
+      action.type === "read_sheet" ? action.payload.target : null,
+    ),
+    [
+      { kind: "id", spreadsheetId: "materials" },
+      { kind: "id", spreadsheetId: "launch" },
+    ],
+  );
+  assert.match(requestBody, /assistant_strategic_discovery/u);
+  assert.doesNotMatch(requestBody, /assistant_plan_outcome/u);
+});
+
+test("final analytical pass can return only a strategic response", async () => {
+  let requestBody = "";
+  const outcome = await planAssistantMessage(
+    "Покажи, где сейчас самые быстрые деньги",
+    {
+      apiKey: "test-key",
+      analysisOnly: true,
+      toolContext: JSON.stringify([
+        {
+          action: { type: "read_sheet" },
+          result: { status: "succeeded", message: "Дмитрий: договор готовится" },
+        },
+      ]),
+      fetchImplementation: (async (_input, init) => {
+        requestBody = String(init?.body ?? "");
+        return Response.json({
+          status: "completed",
+          output_text: JSON.stringify({
+            conclusion:
+              "Ближайший путь к деньгам — довести договор Дмитрия до следующего подтверждённого шага.",
+            strategicView:
+              "Спрос уже подтверждён движением договора; слабое место — отсутствие зафиксированного следующего шага.",
+            actions: [
+              {
+                priority: "Сегодня",
+                subject: "Дмитрий",
+                action: "уточнить последний блокер и согласовать дату следующего решения",
+                evidence: "договор находится в подготовке",
+                why: "эта сделка ближе остальных к оплате",
+                expectedResult: "зафиксирован следующий шаг по договору",
+              },
+            ],
+            doNotDo: ["Не распыляться на холодный поиск до ответа Дмитрия."],
+            rationale: ["Договор уже движется и требует закрытия следующего шага."],
+            uncertainties: ["В данных нет подтверждённой даты оплаты."],
+          }),
+        });
+      }) as typeof fetch,
+    },
+  );
+
+  assert.equal(outcome?.kind, "response");
+  if (!outcome || outcome.kind !== "response") return;
+  assert.match(outcome.text, /Ближайший путь к деньгам/u);
+  assert.match(outcome.text, /Мой стратегический взгляд/u);
+  assert.match(outcome.text, /Дмитрий/u);
+  assert.match(outcome.text, /Основание: договор находится в подготовке/u);
+  assert.match(outcome.text, /Что важно проверить/u);
+  assert.match(requestBody, /assistant_strategic_response/u);
+  assert.match(requestBody, /готовое управленческое решение/u);
+  assert.match(requestBody, /Текущая дата runtime: \d{4}-\d{2}-\d{2}/u);
+  assert.match(requestBody, /Прошедшую дату можно упомянуть только как evidence просрочки/u);
+});
+
+test("retries a truncated strategic response once with compact context", async () => {
+  let calls = 0;
+  const outcome = await planAssistantMessage("Где сейчас быстрые деньги?", {
+    apiKey: "test-key",
+    analysisOnly: true,
+    toolContext: "Дмитрий — договор готов; Марина — ждёт следующий шаг",
+    fetchImplementation: (async () => {
+      calls += 1;
+      return calls === 1
+        ? Response.json({
+            status: "incomplete",
+            incomplete_details: { reason: "max_output_tokens" },
+          })
+        : Response.json({
+            status: "completed",
+            output_text: JSON.stringify({
+              conclusion: "Фокус — договор Дмитрия.",
+              strategicView: "Это ближайшая подтверждённая возможность.",
+              actions: [
+                {
+                  priority: "Сегодня",
+                  subject: "Дмитрий",
+                  action: "согласовать следующий шаг по договору",
+                  evidence: "договор готов",
+                  why: "сделка ближе других к результату",
+                  expectedResult: "следующий шаг зафиксирован",
+                },
+              ],
+              doNotDo: [],
+              rationale: ["Есть готовый договор."],
+              uncertainties: [],
+            }),
+          });
+    }) as typeof fetch,
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(outcome?.kind, "response");
+  if (!outcome || outcome.kind !== "response") return;
+  assert.match(outcome.text, /Дмитрий/u);
+  assert.match(outcome.text, /Основание: договор готов/u);
 });
 
 test("keeps an explicitly named document separate from its tab", () => {

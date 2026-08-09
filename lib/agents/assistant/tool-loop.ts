@@ -4,6 +4,7 @@ import type {
   ActionResult,
   AssistantAction,
   ExistingSheetTarget,
+  SheetCellValue,
 } from "./types";
 
 const DISCOVERY_ACTIONS = new Set<AssistantAction["type"]>([
@@ -62,9 +63,10 @@ export function formatAssistantToolContext(
   results: ActionResult[],
 ) {
   const byId = new Map(results.map((result) => [result.actionId, result]));
-  const observations = plan.actions.map((action) => {
+  const observations = plan.actions.map((action, index) => {
     const result = byId.get(action.id);
-    return {
+    return formatObservation({
+      index,
       action: {
         type: action.type,
         payload: action.payload,
@@ -77,13 +79,65 @@ export function formatAssistantToolContext(
             message: result.message.slice(0, 1_500),
           }
         : { status: "failed", message: "Tool result is missing." },
-    };
+    });
   });
-  const serialized = JSON.stringify(observations);
+  const budget = Math.max(1_500, Math.floor(20_000 / Math.max(1, observations.length)));
 
-  return serialized.length <= 20_000
-    ? serialized
-    : `${serialized.slice(0, 20_000)}…`;
+  return observations
+    .map((observation) => truncateEvenly(observation, budget))
+    .join("\n\n");
+}
+
+function formatObservation({
+  index,
+  action,
+  result,
+}: {
+  index: number;
+  action: { type: AssistantAction["type"]; payload: unknown };
+  result: {
+    status: ActionResult["status"];
+    errorCode?: string;
+    data?: ActionResult["data"];
+    message: string;
+  };
+}) {
+  const lines = [
+    `Наблюдение ${index + 1}`,
+    `Действие: ${action.type}; параметры: ${JSON.stringify(action.payload)}`,
+    `Результат: ${result.status}${result.errorCode ? `; ошибка: ${result.errorCode}` : ""}`,
+    `Сообщение: ${result.message}`,
+  ];
+
+  if (result.data?.kind === "sheet_range") {
+    lines.push(
+      `Таблица: ${result.data.spreadsheetTitle} [${result.data.spreadsheetId}]`,
+      `Диапазон: ${result.data.range}`,
+      "Данные:",
+      ...formatSheetRows(result.data.values),
+    );
+  } else if (result.data) {
+    lines.push(`Данные: ${JSON.stringify(result.data)}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatSheetRows(values: SheetCellValue[][]) {
+  if (!values.length) return ["(пусто)"];
+  const rowBudget = Math.max(120, Math.floor(12_000 / values.length));
+
+  return values.map((row, index) => {
+    const cells = row.map((cell) => String(cell ?? "").trim());
+    return truncateEvenly(`${index + 1}: ${cells.join(" | ")}`, rowBudget);
+  });
+}
+
+function truncateEvenly(value: string, limit: number) {
+  if (value.length <= limit) return value;
+  const headLength = Math.ceil((limit - 3) * 0.65);
+  const tailLength = Math.max(0, limit - 3 - headLength);
+  return `${value.slice(0, headLength)}…${value.slice(value.length - tailLength)}`;
 }
 
 export function mergeDiscoveryPlan(

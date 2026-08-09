@@ -13,9 +13,10 @@ import type {
   AssistantPlanOutcome,
   UpdateSheetAction,
 } from "../lib/agents/assistant/types";
-import type {
-  GoogleSheetsWorkspaceContext,
-  InspectedSheetTab,
+import {
+  formatGoogleSheetsWorkspaceContext,
+  type GoogleSheetsWorkspaceContext,
+  type InspectedSheetTab,
 } from "../lib/integrations/google-sheets/document-context";
 import { buildSheetProfile } from "../lib/integrations/google-sheets/sheet-profile";
 import { buildSheetRowEntities, matchSheetRows } from "../lib/integrations/google-sheets/row-matcher";
@@ -58,6 +59,36 @@ const CONTACT_VALUES: SheetScalar[][] = [
     "Частота проблемы",
   ],
 ];
+
+test("keeps every selected document in a bounded Sheets context", () => {
+  const first = workspace("Проанализируй Мои материалы и Запуск магазина");
+  const baseTab = first.inspectedDocuments[0].tabs[0];
+  const verboseValues: SheetScalar[][] = Array.from({ length: 12 }, (_, index) => [
+    `Лид ${index + 1}`,
+    "Подробный контекст ".repeat(100),
+  ]);
+  const context: GoogleSheetsWorkspaceContext = {
+    availableDocuments: [],
+    inspectedDocuments: [
+      {
+        ...first.inspectedDocuments[0],
+        title: "Мои материалы",
+        tabs: [{ ...baseTab, values: verboseValues }],
+      },
+      {
+        ...first.inspectedDocuments[0],
+        spreadsheetId: "launch-2",
+        title: "Запуск магазина ИИ-агентов — 90 дней",
+        tabs: [{ ...baseTab, title: "ДАШБОРД", values: verboseValues }],
+      },
+    ],
+  };
+  const formatted = formatGoogleSheetsWorkspaceContext(context);
+
+  assert.match(formatted, /Документ: Мои материалы/u);
+  assert.match(formatted, /Документ: Запуск магазина ИИ-агентов/u);
+  assert.ok(formatted.length <= 12_000);
+});
 
 test("normalizes a contact append to the semantic tab instead of a model range", () => {
   const sourceText =

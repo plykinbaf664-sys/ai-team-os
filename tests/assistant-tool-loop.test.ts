@@ -7,6 +7,7 @@ import type {
   ActionResult,
   AssistantPlanOutcome,
 } from "../lib/agents/assistant/types";
+import { formatAssistantToolContext } from "../lib/agents/assistant/tool-loop";
 import {
   executeTickTickAction,
   resolveTaskDueDate,
@@ -119,7 +120,7 @@ test("analytical reads return a grounded strategic answer after replanning", asy
             kind: "ready",
             plan: {
               version: 1,
-              mode: "analytics",
+              mode: "quick_command",
               sourceText: "Проанализируй таблицу",
               continueAfterReads: true,
               actions: [
@@ -136,6 +137,7 @@ test("analytical reads return a grounded strategic answer after replanning", asy
           };
         }
 
+        assert.equal(options.analysisOnly, true);
         assert.match(options.toolContext, /Тёплый лид/u);
         return {
           kind: "response",
@@ -162,6 +164,45 @@ test("analytical reads return a grounded strategic answer after replanning", asy
   assert.equal(planningCalls, 2);
   assert.match(result.text, /дожать тёплые лиды/u);
   assert.equal(result.results[0].status, "succeeded");
+});
+
+test("keeps evidence from every document when tool context is compacted", () => {
+  const actions: ActionPlan["actions"] = Array.from({ length: 6 }, (_, index) => ({
+    id: `read-${index + 1}`,
+    type: "read_sheet" as const,
+    payload: {
+      target: { kind: "id" as const, spreadsheetId: `sheet-${index + 1}` },
+      range: `'Лист ${index + 1}'!A1:L40`,
+    },
+  }));
+  const plan: ActionPlan = {
+    version: 1,
+    mode: "analytics",
+    sourceText: "Проанализируй все документы",
+    actions,
+  };
+  const results: ActionResult[] = actions.map((action, index) => ({
+    actionId: action.id,
+    actionType: action.type,
+    status: "succeeded",
+    message: "Данные прочитаны",
+    data: {
+      kind: "sheet_range",
+      spreadsheetId: `sheet-${index + 1}`,
+      spreadsheetTitle: `Документ ${index + 1}`,
+      range: `'Лист ${index + 1}'!A1:L40`,
+      values: [
+        ["Лид", "Статус", "Следующий шаг"],
+        [`Контакт ${index + 1}`, "Активен", "x".repeat(12_000)],
+      ],
+    },
+  }));
+  const context = formatAssistantToolContext(plan, results);
+
+  for (let index = 1; index <= 6; index += 1) {
+    assert.match(context, new RegExp(`Документ ${index}`, "u"));
+  }
+  assert.ok(context.length <= 20_100);
 });
 
 test("one malformed read action no longer blocks an independent valid action", async () => {

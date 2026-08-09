@@ -37,6 +37,29 @@ type PlannerWireEnvelope = {
   outcome: PlannerWireOutcome;
 };
 
+type StrategicResponseWire = {
+  conclusion: string;
+  strategicView: string;
+  actions: Array<{
+    priority: "Сегодня" | "Следом" | "После этого";
+    subject: string;
+    action: string;
+    evidence: string;
+    why: string;
+    expectedResult: string;
+  }>;
+  doNotDo: string[];
+  rationale: string[];
+  uncertainties: string[];
+};
+
+type StrategicDiscoveryWire = {
+  reads: Array<{
+    spreadsheetId: string;
+    range: string;
+  }>;
+};
+
 const ACTION_TYPES: AssistantAction["type"][] = [
   "add_metrics",
   "update_metrics",
@@ -579,6 +602,88 @@ const STRICT_PLANNER_SCHEMA: Record<string, unknown> = {
   required: ["outcome"],
 };
 
+const STRATEGIC_RESPONSE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    conclusion: { type: "string" },
+    strategicView: { type: "string" },
+    actions: {
+      type: "array",
+      minItems: 1,
+      maxItems: 7,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          priority: {
+            type: "string",
+            enum: ["Сегодня", "Следом", "После этого"],
+          },
+          subject: { type: "string" },
+          action: { type: "string" },
+          evidence: { type: "string" },
+          why: { type: "string" },
+          expectedResult: { type: "string" },
+        },
+        required: [
+          "priority",
+          "subject",
+          "action",
+          "evidence",
+          "why",
+          "expectedResult",
+        ],
+      },
+    },
+    doNotDo: {
+      type: "array",
+      maxItems: 3,
+      items: { type: "string" },
+    },
+    rationale: {
+      type: "array",
+      maxItems: 5,
+      items: { type: "string" },
+    },
+    uncertainties: {
+      type: "array",
+      maxItems: 3,
+      items: { type: "string" },
+    },
+  },
+  required: [
+    "conclusion",
+    "strategicView",
+    "actions",
+    "doNotDo",
+    "rationale",
+    "uncertainties",
+  ],
+};
+
+const STRATEGIC_DISCOVERY_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    reads: {
+      type: "array",
+      minItems: 1,
+      maxItems: 6,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          spreadsheetId: { type: "string" },
+          range: { type: "string" },
+        },
+        required: ["spreadsheetId", "range"],
+      },
+    },
+  },
+  required: ["reads"],
+};
+
 const PLANNER_INSTRUCTIONS = [
   "Ты планировщик личного Assistant Agent. Понимай разговорный русский, включая транскрипты голосовых.",
   "Общайся естественно, коротко и по-человечески. Избегай канцелярита, названий внутренних action и роботизированных формулировок. Допустим лёгкий уместный юмор, но не в ошибках, финансовых расчётах и подтверждениях важных операций.",
@@ -589,6 +694,15 @@ const PLANNER_INSTRUCTIONS = [
   "Ты работаешь в ограниченном tool loop. Если для изменения сначала нужно найти существующую задачу, строку или другой внешний объект, на первом проходе верни только безопасные read actions и continueAfterReads=true.",
   "Если пользователь просит просто показать конкретные данные без анализа, поставь continueAfterReads=false. Если он просит анализ, выводы, узкие места, приоритеты или пошаговый план на основе внешних данных, на первом проходе верни read actions и continueAfterReads=true.",
   "После получения блока «Результаты инструментов»: для аналитического запроса верни outcome=response с коротким выводом, основанным только на прочитанных данных; для изменения данных сформируй конечные write actions либо один действительно необходимый вопрос. Повторное чтение не запускай.",
+  "В аналитическом запросе действуй как стратег пользователя, а не как составитель отчёта. Внутренне: определи желаемый результат и горизонт; выдели подтверждённые возможности и ограничения; ранжируй возможности по близости к цели, скорости результата, вероятности, ценности, наличию следующего шага и блокерам; выбери узкий фокус; преврати его в последовательность конкретных действий; явно отложи то, что сейчас отвлекает.",
+  "Первый аналитический ответ — готовое управленческое решение, а не сырьё анализа. Начни с короткого вывода: где находится ближайший результат, на чём сфокусироваться и что временно не трогать. Затем дай действия в порядке приоритета.",
+  "Каждое рекомендованное действие по возможности привязывай к реальному человеку, компании, проекту, лиду или сегменту из данных. Укажи, что именно сделать, кому и по какому поводу, почему это приоритет, какой наблюдаемый результат должен последовать и когда действовать: сегодня, следом или после этого.",
+  "Не заменяй конкретику абстракциями вроде «поработать с горячими лидами», если в данных есть имена и понятные следующие шаги. Суммы, статусы, договорённости и сроки называй только когда они прямо подтверждены контекстом; иначе сформулируй действие без выдуманного факта.",
+  "При необходимости заверши ответ короткими блоками: что сейчас не делать — максимум три действительно отвлекающих направления; почему выбран этот план — от трёх до пяти коротких тезисов по статусу, близости к результату, активности, следующему шагу, договорённостям, ценности и скорости закрытия. Не создавай пустые разделы ради шаблона.",
+  "Адаптируй длину и форму к сложности ситуации и стилю пользователя. Простое решение дай очень коротко; сложное раскрой настолько, чтобы им можно было действовать без дополнительной расшифровки. В первом ответе сохраняй управленческую ясность и не превращай полезный контекст в длинный пересказ.",
+  "Не показывай без прямого запроса номера строк, координаты, колонки, названия внутренних полей, устройство листов, технические связи, промежуточные рассуждения и архитектуру таблицы. Эти детали используй внутренне как evidence, но не включай в управленческий ответ.",
+  "Продолжай от ранее прочитанных данных и последних сообщений. Не проси повторять контекст, который уже есть в conversation, Project Context или результатах инструментов.",
+  "Сопоставляй даты из данных с текущей датой runtime. Не рекомендуй выполнить действие в уже прошедшую дату: обозначь его как просроченное и перенеси управленческий приоритет на сегодня. Не меняй при этом исходный факт и не придумывай новую договорённость.",
   "Не угадывай ID и координаты: используй точные taskId, spreadsheetId, диапазоны и значения из результатов инструментов.",
   "Когда нужно найти существующую задачу перед изменением, используй list_tasks с limit=50, чтобы ближайшая задача не потерялась среди просроченных.",
   "Если просит увидеть структуру, содержимое или посмотреть таблицу — read_sheet. Явно названный пользователем документ является target title, а название его вкладки используется только в range. Никогда не подменяй название документа названием вкладки из resource context.",
@@ -692,6 +806,7 @@ export async function planAssistantMessage(
     confirmationGranted = false,
     projectContext,
     toolContext = "",
+    analysisOnly = false,
   }: {
     apiKey?: string;
     model?: string;
@@ -702,17 +817,24 @@ export async function planAssistantMessage(
     confirmationGranted?: boolean;
     projectContext?: AssistantProjectContext;
     toolContext?: string;
+    analysisOnly?: boolean;
   } = {},
 ): Promise<AssistantPlanOutcome | null> {
   if (!apiKey) {
     return null;
   }
 
-  const wire = await requestStructuredResponse<PlannerWireEnvelope>({
-    apiKey,
-    model,
-    instructions: PLANNER_INSTRUCTIONS,
-    input: buildPlannerInput(
+  if (analysisOnly && toolContext) {
+    const instructions = [
+      PLANNER_INSTRUCTIONS,
+      "Это финальный аналитический проход. Сначала отдели подтверждённые факты от собственной стратегической интерпретации, затем прими управленческое решение. Не возвращай технический отчёт или просьбу повторно прочитать данные.",
+      `Сегодня ${formatRuntimeDate(projectContext?.timezone)}. Проверь все даты относительно сегодняшнего дня. Прошедшую дату можно упомянуть только как evidence просрочки, но нельзя назначать на неё действие: такое действие поставь в приоритет «сегодня».`,
+      "Conclusion: коротко назови главную проблему, ближайший путь к результату и фокус. StrategicView: изложи собственное профессиональное мнение — причинно-следственную связь, сильную сторону, слабое место и выбранный вектор. Не выдавай гипотезу за факт.",
+      "В actions дай 3–5 решений, если данных достаточно. Subject должен содержать конкретного человека, компанию, сделку, проект или сегмент из прочитанных данных. Если в данных есть имена, запрещены абстракции вроде «горячие лиды» без этих имён.",
+      "Action — точное следующее действие, evidence — короткий подтверждённый факт из данных, why — твоя стратегическая аргументация, expectedResult — проверяемый следующий результат без гарантии оплаты. Не придумывай суммы, договорённости, ответственных и готовность купить.",
+      "Uncertainties заполняй только реальными пробелами или конфликтами данных. Пиши ёмко: максимум пользы и конкретики, минимум пересказа.",
+    ].join("\n");
+    const input = buildPlannerInput(
       sourceText,
       conversation,
       tickTickProjectNames,
@@ -720,17 +842,86 @@ export async function planAssistantMessage(
       confirmationGranted,
       projectContext,
       toolContext,
-    ),
-    schemaName: "assistant_plan_outcome",
-    schema: STRICT_PLANNER_SCHEMA,
-    fetchImplementation,
-  });
+    );
+    const strategicResponse = await requestWithSingleRetry<StrategicResponseWire>({
+      apiKey,
+      model,
+      instructions,
+      input,
+      schemaName: "assistant_strategic_response",
+      schema: STRATEGIC_RESPONSE_SCHEMA,
+      maxOutputTokens: 1_800,
+      fetchImplementation,
+    });
 
-  const outcome = normalizePlannerOutcome(
-    wire.outcome,
+    return {
+      kind: "response",
+      text: formatStrategicDecision(strategicResponse),
+    };
+  }
+
+  if (
+    !toolContext &&
+    googleSheetsContext &&
+    isStrategicAnalysisRequest(sourceText)
+  ) {
+    const discovery = await requestWithSingleRetry<StrategicDiscoveryWire>({
+      apiKey,
+      model,
+      instructions: [
+        "Определи минимальный набор диапазонов Google Sheets, необходимых для управленческого ответа на запрос пользователя.",
+        "Используй только spreadsheet_id и названия листов из runtime-контекста. Не путай название документа с названием листа.",
+        "Если запрошено несколько документов, включи данные каждого. Выбирай содержательные листы с деньгами, лидами, сделками, планом, фактом и активными действиями; не читай всё подряд.",
+        "Верни максимум 6 диапазонов. Используй корректный A1-диапазон вида 'Название листа'!A1:L200 без лишних символов.",
+      ].join("\n"),
+      input: buildPlannerInput(
+        sourceText,
+        conversation,
+        [],
+        googleSheetsContext,
+        false,
+        projectContext,
+      ),
+      schemaName: "assistant_strategic_discovery",
+      schema: STRATEGIC_DISCOVERY_SCHEMA,
+      maxOutputTokens: 700,
+      fetchImplementation,
+    });
+
+    return normalizeStrategicDiscovery(discovery, sourceText);
+  }
+
+  const input = buildPlannerInput(
     sourceText,
+    conversation,
+    tickTickProjectNames,
+    googleSheetsContext,
+    confirmationGranted,
     projectContext,
+    toolContext,
   );
+  const requestPlanner = (retry = false) =>
+    requestStructuredResponse<PlannerWireEnvelope>({
+      apiKey,
+      model,
+      instructions: retry
+        ? `${PLANNER_INSTRUCTIONS}\nПредыдущая попытка не прошла runtime validation. Верни минимальный валидный результат без необязательных деталей.`
+        : PLANNER_INSTRUCTIONS,
+      input: retry ? compactPlannerInput(input) : input,
+      schemaName: "assistant_plan_outcome",
+      schema: STRICT_PLANNER_SCHEMA,
+      fetchImplementation,
+    });
+  let outcome: AssistantPlanOutcome;
+
+  try {
+    const wire = await requestPlanner();
+    outcome = normalizePlannerOutcome(wire.outcome, sourceText, projectContext);
+  } catch (error) {
+    if (!isRetryablePlanningError(error)) throw error;
+    const wire = await requestPlanner(true);
+    outcome = normalizePlannerOutcome(wire.outcome, sourceText, projectContext);
+  }
 
   if (
     !toolContext &&
@@ -748,6 +939,170 @@ export async function planAssistantMessage(
   }
 
   return outcome;
+}
+
+export function isStrategicAnalysisRequest(sourceText: string) {
+  const text = sourceText.toLocaleLowerCase("ru");
+  const asksForDecision =
+    /проанализ|аналитик|стратег|узк(?:ое|ие|их)?\s+мест|бутылоч|точк[аи]\s+рост|приоритет|пошагов|план\s+действ|быстр\w*\s+ден|получить\s+ден|заработ|доход|прибыл|что\s+делать|куда\s+двиг/iu.test(
+      text,
+    );
+  const referencesBusinessData =
+    /таблиц|лист|данн|лид|сделк|проект|продаж|выруч|деньг|запуск|материал|план|факт/iu.test(
+      text,
+    );
+  const asksToChangeData =
+    /добав|внес|обнов|измен|созда|перенес|заверш|удал|очист|запиш|зафиксир/iu.test(
+      text,
+    );
+
+  return asksForDecision && referencesBusinessData && !asksToChangeData;
+}
+
+function normalizeStrategicDiscovery(
+  value: StrategicDiscoveryWire,
+  sourceText: string,
+): AssistantPlanOutcome {
+  const reads = Array.isArray(value.reads)
+    ? value.reads
+        .filter(
+          (read) =>
+            typeof read?.spreadsheetId === "string" &&
+            read.spreadsheetId.trim() &&
+            typeof read.range === "string" &&
+            read.range.includes("!"),
+        )
+        .slice(0, 6)
+    : [];
+
+  if (!reads.length) {
+    throw new Error("Assistant strategic discovery returned no valid ranges.");
+  }
+
+  return {
+    kind: "ready",
+    plan: {
+      version: 1,
+      mode: "analytics",
+      sourceText,
+      continueAfterReads: true,
+      actions: reads.map((read, index) => ({
+        id: `strategic-read-${index + 1}`,
+        type: "read_sheet" as const,
+        payload: {
+          target: {
+            kind: "id" as const,
+            spreadsheetId: read.spreadsheetId.trim(),
+          },
+          range: String(normalizeSheetRange(read.range)),
+        },
+      })),
+    },
+  };
+}
+
+function formatStrategicDecision(value: StrategicResponseWire) {
+  const actions = Array.isArray(value.actions) ? value.actions.slice(0, 7) : [];
+  if (!actions.length) {
+    throw new Error("Assistant strategic response did not contain decisions.");
+  }
+  const lines = [
+    requireText(value.conclusion, "conclusion"),
+    "",
+    "Мой стратегический взгляд",
+    requireText(value.strategicView, "strategicView"),
+    "",
+    "План действий",
+  ];
+
+  for (const [index, action] of actions.entries()) {
+    lines.push(
+      "",
+      `${index + 1}. ${requireText(action.subject, "subject")} — ${requireText(action.action, "action")}`,
+      `Приоритет: ${action.priority}`,
+      `Основание: ${requireText(action.evidence, "evidence")}`,
+      `Почему: ${requireText(action.why, "why")}`,
+      `Ожидаемый результат: ${requireText(action.expectedResult, "expectedResult")}`,
+    );
+  }
+
+  appendStrategicList(lines, "Что сейчас не делать", value.doNotDo, 3);
+  appendStrategicList(lines, "Почему выбран этот вектор", value.rationale, 5);
+  appendStrategicList(lines, "Что важно проверить", value.uncertainties, 3);
+
+  return lines.join("\n").trim();
+}
+
+function appendStrategicList(
+  lines: string[],
+  title: string,
+  values: string[],
+  limit: number,
+) {
+  const items = Array.isArray(values)
+    ? values.map((item) => item.trim()).filter(Boolean).slice(0, limit)
+    : [];
+  if (!items.length) return;
+  lines.push("", title, ...items.map((item) => `- ${item}`));
+}
+
+async function requestWithSingleRetry<T>({
+  apiKey,
+  model,
+  instructions,
+  input,
+  schemaName,
+  schema,
+  maxOutputTokens,
+  fetchImplementation,
+}: {
+  apiKey: string;
+  model: string;
+  instructions: string;
+  input: string;
+  schemaName: string;
+  schema: Record<string, unknown>;
+  maxOutputTokens: number;
+  fetchImplementation: FetchImplementation;
+}) {
+  try {
+    return await requestStructuredResponse<T>({
+      apiKey,
+      model,
+      instructions,
+      input,
+      schemaName,
+      schema,
+      maxOutputTokens,
+      fetchImplementation,
+    });
+  } catch (error) {
+    if (!isRetryablePlanningError(error)) throw error;
+    return requestStructuredResponse<T>({
+      apiKey,
+      model,
+      instructions: `${instructions}\nПовторная попытка: ответ должен быть короче и строго соответствовать схеме.`,
+      input: compactPlannerInput(input),
+      schemaName,
+      schema,
+      maxOutputTokens,
+      fetchImplementation,
+    });
+  }
+}
+
+function isRetryablePlanningError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /invalid|incomplete|output text|json|429|rate|timeout|timed out|503|unavailable|temporar/iu.test(
+    message,
+  );
+}
+
+function compactPlannerInput(input: string, limit = 30_000) {
+  if (input.length <= limit) return input;
+  const headLength = 10_000;
+  const tailLength = limit - headLength;
+  return `${input.slice(0, headLength)}\n\n…контекст компактно сокращён для повторной попытки…\n\n${input.slice(-tailLength)}`;
 }
 
 function buildPlannerInput(
@@ -775,6 +1130,7 @@ function buildPlannerInput(
     .filter(Boolean)
     .slice(0, 30);
   const projectContextText = formatAssistantProjectContext(projectContext);
+  const runtimeDate = formatRuntimeDate(projectContext?.timezone);
 
   if (
     !recentConversation.length &&
@@ -821,11 +1177,25 @@ function buildPlannerInput(
     confirmationGranted
       ? "Пользователь явно подтвердил непосредственно предыдущее ожидающее действие. Верни ready-план исходного действия и не запрашивай подтверждение повторно."
       : "",
+    `Текущая дата runtime: ${runtimeDate}.`,
     "Текущий запрос пользователя:",
     sourceText,
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function formatRuntimeDate(timezone?: string) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone || "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
 }
 
 function normalizePlannerOutcome(

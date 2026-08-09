@@ -462,6 +462,10 @@ test("restores only the immediately confirmed request", () => {
     "Очисти старый диапазон.",
   );
   assert.equal(
+    resolveConfirmedRequest("Я подтверждаю 👍", conversation),
+    "Очисти старый диапазон.",
+  );
+  assert.equal(
     resolveConfirmedRequest("Что именно?", conversation),
     null,
   );

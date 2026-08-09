@@ -37,6 +37,7 @@ export type GoogleSheetsWorkspaceContext = {
 
 const MAX_DOCUMENTS = 3;
 const MAX_TABS_PER_DOCUMENT = 8;
+const MAX_METADATA_TABS_PER_DOCUMENT = 30;
 const MAX_SAMPLE_ROWS = 12;
 const MAX_SAMPLE_COLUMNS = 12;
 const MAX_CONTEXT_CHARACTERS = 12_000;
@@ -45,38 +46,67 @@ export async function inspectGoogleSheetsWorkspace({
   adapter,
   sourceText,
   conversation = [],
+  preferredSpreadsheetIds = [],
+  metadataOnly = false,
 }: {
   adapter: GoogleSheetsAdapter;
   sourceText: string;
   conversation?: AssistantConversationMessage[];
+  preferredSpreadsheetIds?: string[];
+  metadataOnly?: boolean;
 }): Promise<GoogleSheetsWorkspaceContext> {
   const availableDocuments = await adapter.listSpreadsheets();
   const contextText = [
     sourceText,
     ...conversation.slice(-12).map((message) => message.text),
   ].join("\n");
-  const normalizedContext = normalizeText(contextText);
+  const selectionText = [
+    sourceText,
+    ...conversation
+      .filter(
+        (message) =>
+          message.role === "user" ||
+          /работаем\s+с\s+таблиц|активн\w*\s+таблиц|связан\w*\s+таблиц/iu.test(
+            message.text,
+          ),
+      )
+      .slice(-8)
+      .map((message) => message.text),
+  ].join("\n");
+  const normalizedSelection = normalizeText(selectionText);
+  const normalizedSource = normalizeText(sourceText);
   const rankedDocuments = rankDocuments(
     availableDocuments,
-    normalizedContext,
+    normalizedSelection,
   );
-  const exactMentions = rankedDocuments.filter((document) =>
-    normalizedContext.includes(normalizeText(document.title)),
+  const currentMentions = rankedDocuments.filter((document) =>
+    normalizedSource.includes(normalizeText(document.title)),
+  );
+  const contextualMentions = rankedDocuments.filter((document) =>
+    normalizedSelection.includes(normalizeText(document.title)),
   );
   const firstScore = rankedDocuments[0]
-    ? scoreDocument(rankedDocuments[0], normalizedContext)
+    ? scoreDocument(rankedDocuments[0], normalizedSelection)
     : 0;
   const secondScore = rankedDocuments[1]
-    ? scoreDocument(rankedDocuments[1], normalizedContext)
+    ? scoreDocument(rankedDocuments[1], normalizedSelection)
     : 0;
   const hasClearWinner =
     firstScore >= 20 && firstScore >= secondScore + 10;
+  const preferredIds = new Set(preferredSpreadsheetIds);
+  const preferredDocuments = rankedDocuments.filter((document) =>
+    preferredIds.has(document.spreadsheetId),
+  );
+  const fallbackDocuments = hasClearWinner
+    ? rankedDocuments.slice(0, 1)
+    : rankedDocuments;
+  const indicatedDocuments = uniqueDocuments([
+    ...currentMentions,
+    ...preferredDocuments,
+    ...contextualMentions,
+  ]);
   const candidates = (
-    exactMentions.length
-      ? exactMentions
-      : hasClearWinner
-        ? rankedDocuments.slice(0, 1)
-        : rankedDocuments
+    indicatedDocuments.length ? indicatedDocuments : fallbackDocuments
   ).slice(0, MAX_DOCUMENTS);
   const inspectedDocuments: InspectedSpreadsheet[] = [];
 
@@ -85,7 +115,9 @@ export async function inspectGoogleSheetsWorkspace({
       candidate.spreadsheetId,
     );
     inspectedDocuments.push(
-      await inspectSpreadsheet(adapter, metadata, contextText),
+      await inspectSpreadsheet(adapter, metadata, contextText, {
+        metadataOnly,
+      }),
     );
   }
 
@@ -99,6 +131,7 @@ export async function inspectSpreadsheet(
   adapter: GoogleSheetsAdapter,
   metadata: ExistingSpreadsheetMetadata,
   focusText = "",
+  { metadataOnly = false }: { metadataOnly?: boolean } = {},
 ): Promise<InspectedSpreadsheet> {
   const tabs: InspectedSheetTab[] = [];
   const rankedTabs = [...metadata.tabs].sort(
@@ -112,7 +145,10 @@ export async function inspectSpreadsheet(
   const selectedTabs = [
     ...(instructionTab ? [instructionTab] : []),
     ...rankedTabs.filter((tab) => tab !== instructionTab),
-  ].slice(0, MAX_TABS_PER_DOCUMENT);
+  ].slice(
+    0,
+    metadataOnly ? MAX_METADATA_TABS_PER_DOCUMENT : MAX_TABS_PER_DOCUMENT,
+  );
 
   for (const tab of selectedTabs) {
     const rowCount = Math.max(
@@ -124,6 +160,22 @@ export async function inspectSpreadsheet(
       Math.min(tab.columnCount, MAX_SAMPLE_COLUMNS),
     );
     const range = `${quoteSheetTitle(tab.title)}!A1:${columnName(columnCount)}${rowCount}`;
+
+    if (metadataOnly) {
+      tabs.push({
+        title: tab.title,
+        range,
+        values: [],
+        profile: buildSheetProfile({
+          spreadsheet: metadata,
+          tab,
+          values: [],
+        }),
+        entities: [],
+        rowMatches: [],
+      });
+      continue;
+    }
 
     try {
       const sample = await adapter.readRange({
@@ -181,77 +233,120 @@ export async function inspectSpreadsheet(
 
 export function formatGoogleSheetsWorkspaceContext(
   context: GoogleSheetsWorkspaceContext,
+  { includeAvailableDocuments = true }: { includeAvailableDocuments?: boolean } = {},
 ) {
-  const lines = [
-    "Самостоятельно прочитанная структура подходящих документов:",
-  ];
-
-  for (const document of context.inspectedDocuments) {
-    lines.push(
-      "",
-      `Документ: ${document.title}`,
-      `spreadsheet_id: ${document.spreadsheetId}`,
-    );
-
-    for (const tab of document.tabs) {
-      lines.push(`Лист: ${tab.title}; образец: ${tab.range}`);
-      lines.push(
-        `Назначение: ${tab.profile.purpose}; entity_type: ${tab.profile.entityType}; header_row: ${tab.profile.headerRowNumber}`,
-        `Ключевые колонки: ${formatList(tab.profile.keyColumns)}`,
-        `Метрики: ${formatList(tab.profile.metricColumns)}`,
-        `Статусы: ${formatList(tab.profile.statusColumns)}`,
-        `Формулы: ${formatList(tab.profile.formulaColumns)}`,
-        `Защищённые колонки: ${formatList(tab.profile.protectedColumns)}`,
-        `Политики колонок: ${tab.profile.columns
-          .map(
-            (column) =>
-              `${column.columnLetter}:${column.header}=${column.role}/${column.updatePolicy}`,
-          )
-          .join("; ")}`,
-      );
-
-      for (const [index, row] of tab.values.entries()) {
-        lines.push(
-          `${index + 1}: ${row.map(formatCell).join(" | ")}`,
-        );
-      }
-
-      if (tab.rowMatches.length) {
-        lines.push(
-          "Возможные существующие строки:",
-          ...tab.rowMatches.map(
-            (match) =>
-              `- row=${match.entity.rowNumber}; key=${match.entity.rowKey}; confidence=${match.confidence.toFixed(2)}; evidence=${match.evidence.join(", ")}`,
-          ),
-          "При уверенном совпадении нельзя создавать новую строку этой сущности.",
-        );
-      }
-    }
-  }
-
-  lines.push(
-    "",
-    "Другие доступные Google Sheets:",
-    ...context.availableDocuments
-      .filter(
-        (document) =>
-          !context.inspectedDocuments.some(
-            (inspected) =>
-              inspected.spreadsheetId === document.spreadsheetId,
-          ),
-      )
-      .slice(0, 30)
-      .map(
-        (document) =>
-          `- ${document.title} [spreadsheet_id=${document.spreadsheetId}]`,
-      ),
+  const available = includeAvailableDocuments
+    ? context.availableDocuments
+        .filter(
+          (document) =>
+            !context.inspectedDocuments.some(
+              (inspected) =>
+                inspected.spreadsheetId === document.spreadsheetId,
+            ),
+        )
+        .slice(0, 30)
+        .map(
+          (document) =>
+            `- ${document.title} [spreadsheet_id=${document.spreadsheetId}]`,
+        )
+    : [];
+  const availableBlock = available.length
+    ? ["Другие доступные Google Sheets:", ...available]
+        .join("\n")
+        .slice(0, 2_000)
+    : "";
+  const inspectedBudget = Math.max(
+    4_000,
+    MAX_CONTEXT_CHARACTERS - availableBlock.length - 100,
+  );
+  const documentBudget = Math.max(
+    1_200,
+    Math.floor(
+      inspectedBudget / Math.max(1, context.inspectedDocuments.length),
+    ),
+  );
+  const documentBlocks = context.inspectedDocuments.map((document) =>
+    formatInspectedDocument(document, documentBudget),
   );
 
-  const result = lines.join("\n");
+  return [
+    "Самостоятельно прочитанная структура подходящих документов:",
+    ...documentBlocks,
+    availableBlock,
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, MAX_CONTEXT_CHARACTERS);
+}
 
-  return result.length <= MAX_CONTEXT_CHARACTERS
-    ? result
-    : `${result.slice(0, MAX_CONTEXT_CHARACTERS)}\n…контекст документов сокращён`;
+function uniqueDocuments(documents: ExistingSpreadsheetSummary[]) {
+  const seen = new Set<string>();
+  return documents.filter((document) => {
+    if (seen.has(document.spreadsheetId)) return false;
+    seen.add(document.spreadsheetId);
+    return true;
+  });
+}
+
+function formatInspectedDocument(
+  document: InspectedSpreadsheet,
+  budget: number,
+) {
+  const header = `Документ: ${document.title}\nspreadsheet_id: ${document.spreadsheetId}`;
+  const tabBudget = Math.max(
+    350,
+    Math.floor((budget - header.length) / Math.max(1, document.tabs.length)),
+  );
+  const tabs = document.tabs.map((tab) =>
+    truncateContextBlock(formatTabContext(tab), tabBudget),
+  );
+
+  return truncateContextBlock([header, ...tabs].join("\n"), budget);
+}
+
+function formatTabContext(tab: InspectedSheetTab) {
+  if (!tab.values.length && !tab.profile.columns.length) {
+    return `Лист: ${tab.title}; доступен для целевого чтения: ${tab.range}`;
+  }
+
+  const lines = [
+    `Лист: ${tab.title}; образец: ${tab.range}`,
+    `Назначение: ${tab.profile.purpose}; entity_type: ${tab.profile.entityType}; header_row: ${tab.profile.headerRowNumber}`,
+    `Ключевые колонки: ${formatList(tab.profile.keyColumns)}`,
+    `Метрики: ${formatList(tab.profile.metricColumns)}`,
+    `Статусы: ${formatList(tab.profile.statusColumns)}`,
+    `Формулы: ${formatList(tab.profile.formulaColumns)}`,
+    `Защищённые колонки: ${formatList(tab.profile.protectedColumns)}`,
+    `Политики колонок: ${tab.profile.columns
+      .map(
+        (column) =>
+          `${column.columnLetter}:${column.header}=${column.role}/${column.updatePolicy}`,
+      )
+      .join("; ")}`,
+    ...tab.values.map(
+      (row, index) => `${index + 1}: ${row.map(formatCell).join(" | ")}`,
+    ),
+  ];
+
+  if (tab.rowMatches.length) {
+    lines.push(
+      "Возможные существующие строки:",
+      ...tab.rowMatches.map(
+        (match) =>
+          `- row=${match.entity.rowNumber}; key=${match.entity.rowKey}; confidence=${match.confidence.toFixed(2)}; evidence=${match.evidence.join(", ")}`,
+      ),
+      "При уверенном совпадении нельзя создавать новую строку этой сущности.",
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function truncateContextBlock(value: string, limit: number) {
+  if (value.length <= limit) return value;
+  const headLength = Math.ceil((limit - 3) * 0.7);
+  const tailLength = Math.max(0, limit - 3 - headLength);
+  return `${value.slice(0, headLength)}…${value.slice(value.length - tailLength)}`;
 }
 
 function rankDocuments(

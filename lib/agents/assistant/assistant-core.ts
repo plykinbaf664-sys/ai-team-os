@@ -23,7 +23,10 @@ import {
   type GoogleSheetsWorkspaceContext,
 } from "@/lib/integrations/google-sheets/document-context";
 import { createGoogleSheetsAdapterFromEnv } from "@/lib/integrations/google-sheets/google-sheets-adapter";
-import { planAssistantMessage } from "./assistant-planner";
+import {
+  isStrategicAnalysisRequest,
+  planAssistantMessage,
+} from "./assistant-planner";
 import { reconcileConversationDependentActions } from "./conversation-reconciliation";
 import type { AssistantProjectContext } from "./project-context";
 import {
@@ -46,6 +49,7 @@ import type { TickTickProject } from "@/lib/integrations/ticktick/types";
 import {
   createDiscoveryPlan,
   formatAssistantToolContext,
+  isDiscoveryAction,
   mergeDiscoveryPlan,
   repairAssistantReadTargets,
 } from "./tool-loop";
@@ -94,6 +98,7 @@ type AssistantPlanningOptions = {
   confirmationGranted?: boolean;
   projectContext?: AssistantProjectContext;
   toolContext?: string;
+  analysisOnly?: boolean;
 };
 
 type AssistantPlanImplementation = (
@@ -164,6 +169,10 @@ export async function runAssistantPipeline(
           toolContext: formatAssistantToolContext(
             discoveryPlan,
             discoveryResults,
+          ),
+          analysisOnly: shouldFinalizeAsStrategicResponse(
+            discoveryPlan,
+            planningSourceText,
           ),
         });
         outcome =
@@ -276,6 +285,85 @@ export async function runAssistantPipeline(
   };
 }
 
+function shouldFinalizeAsStrategicResponse(
+  plan: ActionPlan,
+  sourceText: string,
+) {
+  if (
+    !plan.actions.length ||
+    !plan.actions.every((action) => isDiscoveryAction(action))
+  ) {
+    return false;
+  }
+
+  if (plan.mode === "analytics") return true;
+
+  const asksForAnalysis =
+    /анализ|вывод|узк(?:ое|ие|их)?\s+мест|фокус|стратег|приоритет|пошаг|план|как\s+[^.?!]*(?:получ|заработ|улучш|увелич)/iu.test(
+      sourceText,
+    );
+  const asksToChangeData =
+    /добав|внес|обнов|измен|созда|перенес|заверш|удал|очист|запиш|зафиксир/iu.test(
+      sourceText,
+    );
+
+  return asksForAnalysis && !asksToChangeData;
+}
+
+function createStrategicDiscoveryFallback(
+  sourceText: string,
+  workspace?: GoogleSheetsWorkspaceContext,
+): AssistantPlanOutcome | null {
+  if (!workspace || !isStrategicAnalysisRequest(sourceText)) return null;
+
+  const queues = workspace.inspectedDocuments.map((document) => ({
+    document,
+    tabs: [...document.tabs].sort(
+      (left, right) => Number(Boolean(right.values.length)) - Number(Boolean(left.values.length)),
+    ),
+  }));
+  const selected: Array<{
+    spreadsheetId: string;
+    range: string;
+  }> = [];
+
+  while (selected.length < 6 && queues.some((queue) => queue.tabs.length)) {
+    for (const queue of queues) {
+      const tab = queue.tabs.shift();
+      if (!tab) continue;
+      selected.push({
+        spreadsheetId: queue.document.spreadsheetId,
+        range: expandSampleRange(tab.range),
+      });
+      if (selected.length === 6) break;
+    }
+  }
+
+  if (!selected.length) return null;
+
+  return {
+    kind: "ready",
+    plan: {
+      version: 1,
+      mode: "analytics",
+      sourceText,
+      continueAfterReads: true,
+      actions: selected.map((read, index) => ({
+        id: `fallback-read-${index + 1}`,
+        type: "read_sheet",
+        payload: {
+          target: { kind: "id", spreadsheetId: read.spreadsheetId },
+          range: read.range,
+        },
+      })),
+    },
+  };
+}
+
+function expandSampleRange(range: string) {
+  return /\d+$/u.test(range) ? range.replace(/\d+$/u, "200") : range;
+}
+
 export async function createAssistantPlan(
   sourceText: string,
   {
@@ -283,18 +371,31 @@ export async function createAssistantPlan(
     confirmationGranted = false,
     projectContext,
     toolContext = "",
+    analysisOnly = false,
   }: {
     conversation?: AssistantConversationMessage[];
     confirmationGranted?: boolean;
     projectContext?: AssistantProjectContext;
     toolContext?: string;
+    analysisOnly?: boolean;
   } = {},
 ): Promise<AssistantPlanOutcome> {
+  let googleSheetsContext: {
+    text: string;
+    workspace?: GoogleSheetsWorkspaceContext;
+  } = { text: "" };
+  let tickTickProjectNames: string[] = [];
+
   try {
-    const [tickTickProjectNames, googleSheetsContext] =
-      await Promise.all([
+    [tickTickProjectNames, googleSheetsContext] = await Promise.all([
         getTickTickProjectNames(),
-        getGoogleSheetsContext(sourceText, conversation, projectContext),
+        toolContext
+          ? Promise.resolve({ text: "", workspace: undefined })
+          : getGoogleSheetsContext(
+              sourceText,
+              conversation,
+              projectContext,
+            ),
       ]);
 
     const outcome =
@@ -303,13 +404,18 @@ export async function createAssistantPlan(
         tickTickProjectNames,
         googleSheetsContext: googleSheetsContext.text,
         confirmationGranted,
-          projectContext,
-          toolContext,
+        projectContext,
+        toolContext,
+        analysisOnly,
       })) ??
       createMockActionPlan(sourceText);
+    const groundedOutcome = groundReadActionsToWorkspace(
+      outcome,
+      googleSheetsContext.workspace,
+    );
 
     const contextualOutcome = reconcileConversationDependentActions(
-      outcome,
+      groundedOutcome,
       {
         sourceText,
         conversation,
@@ -355,6 +461,22 @@ export async function createAssistantPlan(
       "Assistant planner failed; using deterministic fallback:",
       error instanceof Error ? error.message : "unknown error",
     );
+    const strategicFallback = createStrategicDiscoveryFallback(
+      sourceText,
+      googleSheetsContext.workspace,
+    );
+
+    if (strategicFallback) {
+      return strategicFallback;
+    }
+
+    if (analysisOnly && toolContext) {
+      return {
+        kind: "response",
+        text: "Данные прочитаны, но аналитический проход временно не завершился. Повтори запрос — я продолжу с уже сохранённым контекстом.",
+      };
+    }
+
     const fallback = createMockActionPlan(sourceText);
     if (fallback.kind !== "ready") return fallback;
     const strategicPlan = attachStrategicPlan(
@@ -371,6 +493,128 @@ export async function createAssistantPlan(
       }),
     };
   }
+}
+
+export function groundReadActionsToWorkspace(
+  outcome: AssistantPlanOutcome,
+  workspace?: GoogleSheetsWorkspaceContext,
+): AssistantPlanOutcome {
+  if (outcome.kind !== "ready" || !workspace) return outcome;
+  const seen = new Set<string>();
+  const actions = outcome.plan.actions.flatMap((action) => {
+    if (action.type !== "read_sheet" || !action.payload.range) {
+      return [action];
+    }
+    const document = resolveReadDocument(action.payload.target, workspace);
+    const requestedTab = extractReadTabTitle(action.payload.range);
+    if (!document) {
+      return [
+        {
+          ...action,
+          payload: {
+            ...action.payload,
+            range: boundReadRange(action.payload.range, requestedTab),
+          },
+        },
+      ];
+    }
+    const tab = resolveReadTab(requestedTab, document.tabs.map((item) => item.title));
+    if (!tab) return [];
+    const range = boundReadRange(action.payload.range, tab);
+    const key = `${document.spreadsheetId}:${range}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+
+    return [
+      {
+        ...action,
+        payload: {
+          ...action.payload,
+          target: {
+            kind: "id" as const,
+            spreadsheetId: document.spreadsheetId,
+          },
+          range,
+        },
+      },
+    ];
+  });
+
+  return actions.length
+    ? { ...outcome, plan: { ...outcome.plan, actions } }
+    : outcome;
+}
+
+function resolveReadDocument(
+  target: ExistingSheetTarget | undefined,
+  workspace: GoogleSheetsWorkspaceContext,
+) {
+  if (target?.kind === "id") {
+    return workspace.inspectedDocuments.find(
+      (document) => document.spreadsheetId === target.spreadsheetId,
+    );
+  }
+  if (target?.kind === "title") {
+    const requested = normalizeResourceName(target.title);
+    return workspace.inspectedDocuments.find(
+      (document) => normalizeResourceName(document.title) === requested,
+    );
+  }
+  return undefined;
+}
+
+function extractReadTabTitle(range: string) {
+  return range
+    .split("!", 1)[0]
+    .trim()
+    .replace(/^'(.*)'$/u, "$1")
+    .replace(/''/g, "'");
+}
+
+function resolveReadTab(requestedTitle: string, availableTitles: string[]) {
+  const requested = normalizeResourceName(requestedTitle);
+  const exact = availableTitles.find(
+    (title) => normalizeResourceName(title) === requested,
+  );
+  if (exact) return exact;
+
+  const partial = availableTitles.filter((title) => {
+    const candidate = normalizeResourceName(title);
+    return candidate.includes(requested) || requested.includes(candidate);
+  });
+  return partial.length === 1 ? partial[0] : undefined;
+}
+
+function boundReadRange(range: string, actualTabTitle: string) {
+  const coordinates = range.split("!").slice(1).join("!").replace(/\$/g, "");
+  const match = coordinates.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/iu);
+  if (!match) return `'${actualTabTitle.replace(/'/g, "''")}'!A1:L40`;
+  const startColumn = readColumnIndex(match[1]);
+  const startRow = Number(match[2]);
+  const endColumn = readColumnIndex(match[3]);
+  const requestedEndRow = Number(match[4]);
+  const columnCount = Math.max(1, endColumn - startColumn + 1);
+  const maximumRows = Math.max(1, Math.floor(500 / columnCount));
+  const endRow = Math.min(requestedEndRow, startRow + maximumRows - 1);
+
+  return `'${actualTabTitle.replace(/'/g, "''")}'!${match[1].toUpperCase()}${startRow}:${match[3].toUpperCase()}${endRow}`;
+}
+
+function readColumnIndex(column: string) {
+  return [...column.toUpperCase()].reduce(
+    (result, character) =>
+      result * 26 + character.charCodeAt(0) - 64,
+    0,
+  );
+}
+
+function normalizeResourceName(value: string) {
+  return value
+    .normalize("NFC")
+    .toLocaleLowerCase("ru")
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
 }
 
 export function resolveConfirmedRequest(
@@ -420,7 +664,9 @@ function isExplicitConfirmationText(value: string) {
     .replace(
       /^(?:ассистент|assistant)(?:@\w+)?[\s,.:;—-]+/iu,
       "",
-    );
+    )
+    .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, "")
+    .trim();
 
   return /^(?:я\s+)?(?:подтверждаю|подтверждено|выполняй|применяй|да[\s,.:;-]*(?:подтверждаю|выполняй|делай|применяй))[\s.!]*$/iu.test(
     normalized,
@@ -446,20 +692,22 @@ async function getGoogleSheetsContext(
   }
 
   try {
+    const strategicAnalysis = isStrategicAnalysisRequest(sourceText);
     const workspace = await inspectGoogleSheetsWorkspace({
       adapter,
-      sourceText: [
-        sourceText,
-        ...(projectContext?.activeProject?.resources ?? [])
-          .filter(
-            (resource) => resource.resourceType === "google_sheet",
-          )
-          .map((resource) => resource.title),
-      ].join("\n"),
+      sourceText,
       conversation,
+      preferredSpreadsheetIds: (
+        projectContext?.activeProject?.resources ?? []
+      )
+        .filter((resource) => resource.resourceType === "google_sheet")
+        .map((resource) => resource.externalId),
+      metadataOnly: strategicAnalysis,
     });
     return {
-      text: formatGoogleSheetsWorkspaceContext(workspace),
+      text: formatGoogleSheetsWorkspaceContext(workspace, {
+        includeAvailableDocuments: !strategicAnalysis,
+      }),
       workspace,
     };
   } catch (error) {
@@ -1171,11 +1419,15 @@ export function enforceAssistantSafety(
 }
 
 function hasDangerousPlannedAction(actions: AssistantAction[]) {
-  if (actions.length > 5) {
+  const mutatingActions = actions.filter((action) =>
+    isMutatingAction(action),
+  );
+
+  if (mutatingActions.length > 5) {
     return true;
   }
 
-  return actions.some((action) => {
+  return mutatingActions.some((action) => {
     if (action.type === "create_sheet_tab") {
       return true;
     }
@@ -1193,6 +1445,16 @@ function hasDangerousPlannedAction(actions: AssistantAction[]) {
 
     return rowCount > 5 || cellCount > 50;
   });
+}
+
+function isMutatingAction(action: AssistantAction) {
+  return ![
+    "find_sheet",
+    "read_sheet",
+    "list_tasks",
+    "analyze_metrics",
+    "generate_daily_summary",
+  ].includes(action.type);
 }
 
 function clarification(question: string, missingField: string): AssistantPlanOutcome {
