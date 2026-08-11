@@ -149,6 +149,51 @@ test("one explicitly selected task can be completed without another question", (
   assert.equal(evaluation.assessments[0].decision, "execute");
 });
 
+test("small grounded task sync is automatic but a mass sync needs confirmation", () => {
+  const makePlan = (count: number): ActionPlan => ({
+    version: 1,
+    mode: "batch_report",
+    sourceText: "Синхронизируй конкретные задачи с таблицей",
+    actions: Array.from({ length: count }, (_, index) => ({
+      id: `task-${index + 1}`,
+      type: "update_task" as const,
+      payload: {
+        taskId: `external-${index + 1}`,
+        changes: { priority: "low" as const },
+      },
+    })),
+    strategicPlan: {
+      version: 1,
+      userGoal: "Синхронизировать задачи",
+      projectId: "project-1",
+      targetResources: [],
+      factsFromMessage: [],
+      factsFromContext: [],
+      assumptions: [],
+      actions: Array.from({ length: count }, (_, index) => ({
+        id: `execute-${index + 1}`,
+        kind: "execute_action" as const,
+        linkedActionId: `task-${index + 1}`,
+        actionType: "update_task" as const,
+        reason: "Задача однозначно сопоставлена.",
+        evidence: [`external-${index + 1}`],
+        confidence: 0.95,
+        executionPolicy: "auto_execute" as const,
+        expectedChange: "Понизить приоритет.",
+        verification: "Перечитать задачу.",
+      })),
+      suggestions: [],
+      summaryIntent: "Синхронизировать задачи.",
+    },
+  });
+
+  const small = evaluateActionPlanPolicy(makePlan(5), resolvedContext);
+  const mass = evaluateActionPlanPolicy(makePlan(6), resolvedContext);
+
+  assert.ok(small.assessments.every((item) => item.decision === "execute"));
+  assert.ok(mass.assessments.every((item) => item.decision === "confirm"));
+});
+
 test("adaptive questions deduplicate and number only when needed", () => {
   assert.equal(formatAdaptiveQuestions(["Какой проект?", "Какой проект?"]), "Какой проект?");
   assert.equal(

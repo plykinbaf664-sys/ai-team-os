@@ -26,6 +26,7 @@ import { createGoogleSheetsAdapterFromEnv } from "@/lib/integrations/google-shee
 import {
   isStrategicAnalysisRequest,
   planAssistantMessage,
+  requestsStrategicOutput,
 } from "./assistant-planner";
 import { reconcileConversationDependentActions } from "./conversation-reconciliation";
 import type { AssistantProjectContext } from "./project-context";
@@ -48,11 +49,17 @@ import {
 import type { TickTickProject } from "@/lib/integrations/ticktick/types";
 import {
   createDiscoveryPlan,
+  ensureTaskMutationDiscovery,
   formatAssistantToolContext,
   isDiscoveryAction,
   mergeDiscoveryPlan,
   repairAssistantReadTargets,
 } from "./tool-loop";
+import {
+  hasOperationalMutationIntent,
+  reconcileOperationalActions,
+  resolveOperationalContinuation,
+} from "./operational-reconciliation";
 
 const ASSISTANT_MODES: AssistantMode[] = [
   "quick_command",
@@ -129,7 +136,11 @@ export async function runAssistantPipeline(
     sourceText,
     conversation,
   );
-  const planningSourceText = confirmedSourceText ?? sourceText;
+  const contextualSourceText = resolveOperationalContinuation(
+    sourceText,
+    conversation,
+  );
+  const planningSourceText = confirmedSourceText ?? contextualSourceText;
   const plannedOutcome = await planImplementation(planningSourceText, {
     conversation,
     confirmationGranted: confirmedSourceText !== null,
@@ -138,14 +149,17 @@ export async function runAssistantPipeline(
   let outcome =
     confirmedSourceText !== null
       ? plannedOutcome
-      : enforceAssistantSafety(sourceText, plannedOutcome);
+      : enforceAssistantSafety(planningSourceText, plannedOutcome);
   let discoveryPlan: ActionPlan | null = null;
   let discoveryResults: ActionResult[] = [];
+  let discoveryToolContext = "";
 
   if (outcome.kind === "ready") {
     outcome = {
       ...outcome,
-      plan: repairAssistantReadTargets(outcome.plan, projectContext),
+      plan: ensureTaskMutationDiscovery(
+        repairAssistantReadTargets(outcome.plan, projectContext),
+      ),
     };
     discoveryPlan = createDiscoveryPlan(outcome.plan);
 
@@ -162,23 +176,78 @@ export async function runAssistantPipeline(
       ]);
 
       if (discoveryResults.some((result) => result.status === "succeeded")) {
-        const replanned = await planImplementation(planningSourceText, {
+        const toolContext = formatAssistantToolContext(
+          discoveryPlan,
+          discoveryResults,
+        );
+        discoveryToolContext = toolContext;
+        let replanned = await planImplementation(planningSourceText, {
           conversation,
           confirmationGranted: confirmedSourceText !== null,
           projectContext,
-          toolContext: formatAssistantToolContext(
-            discoveryPlan,
-            discoveryResults,
-          ),
+          toolContext,
           analysisOnly: shouldFinalizeAsStrategicResponse(
             discoveryPlan,
             planningSourceText,
           ),
         });
+        replanned = sanitizePostDiscoveryOutcome(
+          reconcileOperationalActions(replanned, {
+            sourceText: planningSourceText,
+            conversation,
+            discoveryResults,
+          }),
+        );
+
+        if (
+          replanned.kind === "ready" &&
+          replanned.plan.actions.length === 0 &&
+          hasOperationalMutationIntent(planningSourceText)
+        ) {
+          const recovered = await planImplementation(planningSourceText, {
+            conversation,
+            confirmationGranted: confirmedSourceText !== null,
+            projectContext,
+            toolContext: [
+              toolContext,
+              "Runtime correction: данные уже прочитаны. Повторные read actions запрещены. Верни только конкретные write actions для однозначных изменений либо итоговый ответ, если менять нечего.",
+            ].join("\n\n"),
+            analysisOnly: false,
+          });
+          replanned = sanitizePostDiscoveryOutcome(
+            reconcileOperationalActions(recovered, {
+              sourceText: planningSourceText,
+              conversation,
+              discoveryResults,
+            }),
+          );
+        }
+
+        const groundedReplan = replanned;
         outcome =
           confirmedSourceText !== null
-            ? replanned
-            : enforceAssistantSafety(sourceText, replanned);
+            ? groundedReplan
+            : enforceAssistantSafety(planningSourceText, groundedReplan);
+
+        if (
+          outcome.kind === "ready" &&
+          outcome.plan.actions.length === 0
+        ) {
+          if (requestsStrategicOutput(planningSourceText)) {
+            outcome = await planImplementation(planningSourceText, {
+              conversation,
+              confirmationGranted: confirmedSourceText !== null,
+              projectContext,
+              toolContext,
+              analysisOnly: true,
+            });
+          } else {
+            outcome = {
+              kind: "response",
+              text: "Данные сверил, но однозначных изменений для безопасного выполнения не нашёл.",
+            };
+          }
+        }
 
         if (outcome.kind === "ready") {
           outcome = {
@@ -193,7 +262,7 @@ export async function runAssistantPipeline(
         return {
           outcome: { kind: "ready", plan: discoveryPlan },
           results: discoveryResults,
-          text: composeStrategicResponse(discoveryPlan, discoveryResults),
+          text: "Не смог прочитать необходимые данные. Ничего не изменял — сначала нужно восстановить доступ к связанным ресурсам.",
           projectContext,
         };
       }
@@ -201,10 +270,29 @@ export async function runAssistantPipeline(
   }
 
   if (outcome.kind === "response") {
+    if (
+      discoveryPlan &&
+      discoveryToolContext &&
+      requestsStrategicOutput(planningSourceText) &&
+      hasOperationalMutationIntent(planningSourceText)
+    ) {
+      const strategicOutcome = await planImplementation(planningSourceText, {
+        conversation,
+        confirmationGranted: confirmedSourceText !== null,
+        projectContext,
+        toolContext: discoveryToolContext,
+        analysisOnly: true,
+      });
+      if (strategicOutcome.kind === "response") outcome = strategicOutcome;
+    }
+
     return {
       outcome,
       results: discoveryResults,
-      text: outcome.text,
+      text: sanitizeOperationalResponseText(
+        outcome.text,
+        Boolean(discoveryPlan) && hasOperationalMutationIntent(planningSourceText),
+      ),
       projectContext,
     };
   }
@@ -242,7 +330,10 @@ export async function runAssistantPipeline(
     return {
       outcome: { kind: "ready", plan: reportedPlan },
       results,
-      text: composeStrategicResponse(reportedPlan, results),
+      text: composeStrategicResponse(reportedPlan, results, [], {
+        hideReadDetails: Boolean(discoveryPlan),
+        includeStrategy: requestsStrategicOutput(planningSourceText),
+      }),
       projectContext,
     };
   }
@@ -271,11 +362,46 @@ export async function runAssistantPipeline(
     ? mergeDiscoveryPlan(outcome.plan, discoveryPlan)
     : outcome.plan;
   const results = [...discoveryResults, ...finalResults];
-  const resultText = composeStrategicResponse(
+  let resultText = composeStrategicResponse(
     reportedPlan,
     results,
     policy.clarificationQuestions,
+    {
+      hideReadDetails: Boolean(discoveryPlan),
+      includeStrategy: requestsStrategicOutput(planningSourceText),
+    },
   );
+
+  if (
+    discoveryPlan &&
+    requestsStrategicOutput(planningSourceText) &&
+    hasOperationalMutationIntent(planningSourceText)
+  ) {
+    const strategicOutcome = await planImplementation(planningSourceText, {
+      conversation,
+      confirmationGranted: confirmedSourceText !== null,
+      projectContext,
+      toolContext: [
+        formatAssistantToolContext(discoveryPlan, discoveryResults),
+        formatAssistantToolContext(outcome.plan, finalResults),
+      ].join("\n\n"),
+      analysisOnly: true,
+    });
+    if (strategicOutcome.kind === "response") {
+      const executionText = composeStrategicResponse(
+        outcome.plan,
+        finalResults,
+        policy.clarificationQuestions,
+        { hideReadDetails: true, includeStrategy: false },
+      );
+      resultText = [
+        executionText === "Не удалось получить результат." ? "" : executionText,
+        strategicOutcome.text,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+  }
 
   return {
     outcome: { kind: "ready", plan: reportedPlan },
@@ -296,18 +422,57 @@ function shouldFinalizeAsStrategicResponse(
     return false;
   }
 
-  if (plan.mode === "analytics") return true;
-
   const asksForAnalysis =
     /анализ|вывод|узк(?:ое|ие|их)?\s+мест|фокус|стратег|приоритет|пошаг|план|как\s+[^.?!]*(?:получ|заработ|улучш|увелич)/iu.test(
       sourceText,
     );
-  const asksToChangeData =
-    /добав|внес|обнов|измен|созда|перенес|заверш|удал|очист|запиш|зафиксир/iu.test(
-      sourceText,
-    );
+  const asksToChangeData = hasOperationalMutationIntent(sourceText);
 
-  return asksForAnalysis && !asksToChangeData;
+  if (asksToChangeData) return false;
+  if (plan.mode === "analytics") return true;
+
+  return asksForAnalysis;
+}
+
+function sanitizePostDiscoveryOutcome(
+  outcome: AssistantPlanOutcome,
+): AssistantPlanOutcome {
+  if (outcome.kind !== "ready") return outcome;
+  const actions = outcome.plan.actions.filter(
+    (action) => !isDiscoveryAction(action),
+  );
+  const retainedIds = new Set(actions.map((action) => action.id));
+  const strategicPlan = outcome.plan.strategicPlan
+    ? {
+        ...outcome.plan.strategicPlan,
+        actions: outcome.plan.strategicPlan.actions.filter(
+          (action) =>
+            !action.linkedActionId || retainedIds.has(action.linkedActionId),
+        ),
+      }
+    : undefined;
+
+  return {
+    ...outcome,
+    plan: {
+      ...outcome.plan,
+      actions,
+      strategicPlan,
+      continueAfterReads: false,
+    },
+  };
+}
+
+function sanitizeOperationalResponseText(text: string, enabled: boolean) {
+  if (!enabled) return text;
+  if (
+    /Открытые задачи TickTick|Показаны первые\s+\d+\s+задач|(?:^|\n)\s*\d+:\s+[^\n|]+\|/iu.test(
+      text,
+    )
+  ) {
+    return "Данные прочитал и использовал внутренне, но итоговый проход не сформировал безопасный результат. Списки задач и строки таблиц намеренно не показываю.";
+  }
+  return text;
 }
 
 function createStrategicDiscoveryFallback(
@@ -505,8 +670,12 @@ export function groundReadActionsToWorkspace(
     if (action.type !== "read_sheet" || !action.payload.range) {
       return [action];
     }
-    const document = resolveReadDocument(action.payload.target, workspace);
     const requestedTab = extractReadTabTitle(action.payload.range);
+    const document = resolveReadDocument(
+      action.payload.target,
+      requestedTab,
+      workspace,
+    );
     if (!document) {
       return [
         {
@@ -547,6 +716,7 @@ export function groundReadActionsToWorkspace(
 
 function resolveReadDocument(
   target: ExistingSheetTarget | undefined,
+  requestedTab: string,
   workspace: GoogleSheetsWorkspaceContext,
 ) {
   if (target?.kind === "id") {
@@ -556,11 +726,19 @@ function resolveReadDocument(
   }
   if (target?.kind === "title") {
     const requested = normalizeResourceName(target.title);
-    return workspace.inspectedDocuments.find(
+    const exactDocument = workspace.inspectedDocuments.find(
       (document) => normalizeResourceName(document.title) === requested,
     );
+    if (exactDocument) return exactDocument;
   }
-  return undefined;
+
+  const requested = normalizeResourceName(requestedTab);
+  const tabMatches = workspace.inspectedDocuments.filter((document) =>
+    document.tabs.some(
+      (tab) => normalizeResourceName(tab.title) === requested,
+    ),
+  );
+  return tabMatches.length === 1 ? tabMatches[0] : undefined;
 }
 
 function extractReadTabTitle(range: string) {
@@ -1533,6 +1711,12 @@ function validatePayload(
       requireSelector(payload, "taskId", "taskTitle", path, errors);
       break;
     case "list_tasks":
+      if (
+        payload.query !== undefined &&
+        !isNonEmptyString(payload.query)
+      ) {
+        errors.push(`${path}.payload.query is invalid`);
+      }
       if (
         payload.limit !== undefined &&
         (!Number.isInteger(payload.limit) ||

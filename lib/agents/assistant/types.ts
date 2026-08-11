@@ -98,6 +98,7 @@ export type ListTasksAction = Action<
   "list_tasks",
   {
     project?: string;
+    query?: string;
     limit?: number;
   }
 >;

@@ -527,6 +527,78 @@ test("lists open TickTick tasks across projects with useful details", async () =
   );
 });
 
+test("filters TickTick discovery by title or card content before applying limit", async () => {
+  const result = await executeTickTickAction(
+    {
+      id: "action-1",
+      type: "list_tasks",
+      payload: { query: "Анастасия Речанская", limit: 1 },
+    },
+    fakeAdapter({
+      projectData: {
+        "project-1": {
+          project: PROJECTS[0],
+          tasks: [
+            task({ id: "other", title: "Срочная задача", priority: 5 }),
+            task({
+              id: "anastasia",
+              title: "Анастасия Речанская — получить срок решения",
+              content: "Оплата на согласовании.",
+            }),
+          ],
+        },
+        "project-2": { project: PROJECTS[1], tasks: [] },
+      },
+    }),
+  );
+
+  assert.equal(result?.status, "succeeded");
+  assert.equal(result?.data?.kind, "ticktick_tasks");
+  if (result?.data?.kind === "ticktick_tasks") {
+    assert.deepEqual(result.data.tasks.map((item) => item.id), ["anastasia"]);
+  }
+});
+
+test("does not append a fact already represented in a TickTick card", async () => {
+  let updateCalls = 0;
+  const result = await executeTickTickAction(
+    {
+      id: "action-1",
+      type: "update_task",
+      payload: {
+        taskId: "dmitry",
+        changes: {
+          contentNote:
+            "Добавлена пометка: работа с Дмитрием стартует не раньше сентября, он формирует команду продаж.",
+        },
+      },
+    },
+    fakeAdapter({
+      projectData: {
+        "project-1": {
+          project: PROJECTS[0],
+          tasks: [
+            task({
+              id: "dmitry",
+              title: "Дмитрий CashU — вернуться после настройки отдела продаж",
+              content: "Работу начнём в сентябре: Дмитрий формирует команду продаж.",
+            }),
+          ],
+        },
+        "project-2": { project: PROJECTS[1], tasks: [] },
+      },
+      updateTask: async (input) => {
+        updateCalls += 1;
+        return task({ id: input.id, title: input.title, content: input.content });
+      },
+    }),
+  );
+
+  assert.equal(result?.status, "succeeded");
+  assert.equal(updateCalls, 0);
+  assert.match(result?.message ?? "", /уже актуальна/iu);
+});
+
 test("rejects mass process tasks and unclear deadlines", async () => {
   const massResult = await executeTickTickAction(
     {

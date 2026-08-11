@@ -37,10 +37,79 @@ export function repairAssistantReadTargets(
   return { ...plan, actions };
 }
 
+export function ensureTaskMutationDiscovery(plan: ActionPlan): ActionPlan {
+  const unresolved = plan.actions.filter(
+    (
+      action,
+    ): action is Extract<
+      AssistantAction,
+      { type: "update_task" | "complete_task" }
+    > =>
+      (action.type === "update_task" || action.type === "complete_task") &&
+      !action.payload.taskId,
+  );
+  if (!unresolved.length) return plan;
+
+  const existingSearches = plan.actions.filter(
+    (action): action is Extract<AssistantAction, { type: "list_tasks" }> =>
+      action.type === "list_tasks",
+  );
+  const hasBroadSearch = existingSearches.some(
+    (action) => !action.payload.query?.trim(),
+  );
+  if (hasBroadSearch) {
+    return { ...plan, continueAfterReads: true };
+  }
+
+  const existingQueries = new Set(
+    existingSearches
+      .map((action) => normalize(action.payload.query ?? ""))
+      .filter(Boolean),
+  );
+  const usedIds = new Set(plan.actions.map((action) => action.id));
+  const searches: AssistantAction[] = [];
+
+  for (const action of unresolved) {
+    const query = action.payload.taskTitle?.trim();
+    const normalizedQuery = normalize(query ?? "");
+    if (normalizedQuery && existingQueries.has(normalizedQuery)) continue;
+
+    let index = searches.length + 1;
+    let id = `runtime-task-search-${index}`;
+    while (usedIds.has(id)) {
+      index += 1;
+      id = `runtime-task-search-${index}`;
+    }
+    usedIds.add(id);
+    if (normalizedQuery) existingQueries.add(normalizedQuery);
+    searches.push({
+      id,
+      type: "list_tasks",
+      payload: {
+        ...(query ? { query } : {}),
+        limit: 50,
+      },
+    });
+  }
+
+  return {
+    ...plan,
+    actions: [...searches, ...plan.actions],
+    continueAfterReads: true,
+  };
+}
+
 export function createDiscoveryPlan(plan: ActionPlan): ActionPlan | null {
   if (plan.continueAfterReads !== true) return null;
+  const seen = new Set<string>();
   const actions = plan.actions
     .filter((action) => DISCOVERY_ACTIONS.has(action.type))
+    .filter((action) => {
+      const key = `${action.type}:${JSON.stringify(action.payload)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .slice(0, 6)
     .map((action, index) => ({
       ...action,

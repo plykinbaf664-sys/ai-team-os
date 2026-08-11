@@ -1,13 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runAssistantPipeline } from "../lib/agents/assistant/assistant-core";
+import {
+  groundReadActionsToWorkspace,
+  runAssistantPipeline,
+} from "../lib/agents/assistant/assistant-core";
 import type { AssistantProjectContext } from "../lib/agents/assistant/project-context";
 import type {
   ActionPlan,
   ActionResult,
   AssistantPlanOutcome,
 } from "../lib/agents/assistant/types";
-import { formatAssistantToolContext } from "../lib/agents/assistant/tool-loop";
+import {
+  createDiscoveryPlan,
+  ensureTaskMutationDiscovery,
+  formatAssistantToolContext,
+} from "../lib/agents/assistant/tool-loop";
+import {
+  reconcileOperationalActions,
+  resolveOperationalContinuation,
+} from "../lib/agents/assistant/operational-reconciliation";
+import { requestsStrategicOutput } from "../lib/agents/assistant/assistant-planner";
+import type { GoogleSheetsWorkspaceContext } from "../lib/integrations/google-sheets/document-context";
 import {
   executeTickTickAction,
   resolveTaskDueDate,
@@ -164,6 +177,572 @@ test("analytical reads return a grounded strategic answer after replanning", asy
   assert.equal(planningCalls, 2);
   assert.match(result.text, /дожать тёплые лиды/u);
   assert.equal(result.results[0].status, "succeeded");
+});
+
+test("title-only TickTick mutations are converted to hidden searches", () => {
+  const plan: ActionPlan = {
+    version: 1,
+    mode: "batch_report",
+    sourceText: "Обнови карточки Анастасии и Дмитрия",
+    actions: [
+      {
+        id: "anastasia",
+        type: "update_task",
+        payload: {
+          taskTitle: "Анастасия Речанская",
+          changes: { contentNote: "Согласование оплаты может занять несколько месяцев." },
+        },
+      },
+      {
+        id: "dmitry",
+        type: "update_task",
+        payload: {
+          taskTitle: "Дмитрий",
+          changes: { contentNote: "Старт работы в сентябре после найма команды продаж." },
+        },
+      },
+    ],
+  };
+
+  const prepared = ensureTaskMutationDiscovery(plan);
+  const discovery = createDiscoveryPlan(prepared);
+
+  assert.equal(prepared.continueAfterReads, true);
+  assert.deepEqual(
+    discovery?.actions.map((action) => action.payload),
+    [
+      { query: "Анастасия Речанская", limit: 50 },
+      { query: "Дмитрий", limit: 50 },
+    ],
+  );
+});
+
+test("grounds short TickTick selectors by card context and prevents inferred moves", () => {
+  const sourceText =
+    "Обнови карточку Анастасии: согласование оплаты может занять несколько месяцев. В карточке Дмитрия отметь, что работа начнётся в сентябре после найма команды продаж.";
+  const outcome: AssistantPlanOutcome = {
+    kind: "ready",
+    plan: {
+      version: 1,
+      mode: "batch_report",
+      sourceText,
+      actions: [
+        {
+          id: "anastasia",
+          type: "update_task",
+          payload: {
+            taskTitle: "Анастасия Речанская",
+            changes: {
+              contentNote: "Оплата может задержаться на несколько месяцев из-за согласований.",
+              project: "AI Marketplace — 90 дней",
+            },
+          },
+        },
+        {
+          id: "dmitry",
+          type: "update_task",
+          payload: {
+            taskTitle: "Дмитрий",
+            changes: {
+              contentNote: "Работа начнётся в сентябре после найма команды продаж.",
+              project: "AI Marketplace — 90 дней",
+            },
+          },
+        },
+      ],
+    },
+  };
+  const reconciled = reconcileOperationalActions(outcome, {
+    sourceText,
+    conversation: [],
+    discoveryResults: [
+      tickTickTasksResult([
+        {
+          id: "anastasia-id",
+          projectId: "money",
+          projectName: "Скрытые деньги",
+          title: "Анастасия Речанская — получить срок решения по 100 000 ₽",
+          content: "Оффер на внутреннем согласовании; оплата может занять несколько месяцев.",
+          priority: 3,
+        },
+        {
+          id: "dmitry-cashu",
+          projectId: "money",
+          projectName: "Скрытые деньги",
+          title: "Дмитрий CashU — вернуться после настройки отдела продаж",
+          content: "В сентябре нанимает и обучает команду продаж; работу начать после этого.",
+          priority: 1,
+        },
+        {
+          id: "dmitry-offer",
+          projectId: "money",
+          projectName: "Скрытые деньги",
+          title: "Дмитрий Щерба — одно повторное касание по КП",
+          content: "Отправлено коммерческое предложение.",
+          priority: 1,
+        },
+        {
+          id: "dmitry-structure",
+          projectId: "money",
+          projectName: "Скрытые деньги",
+          title: "Дмитрий Чернышев — отправить структуру",
+          content: "Следующий шаг — отправить материалы.",
+          priority: 1,
+        },
+      ]),
+    ],
+  });
+
+  assert.equal(reconciled.kind, "ready");
+  if (reconciled.kind !== "ready") return;
+  const taskActions = reconciled.plan.actions.filter(
+    (action): action is Extract<ActionPlan["actions"][number], { type: "update_task" }> =>
+      action.type === "update_task",
+  );
+  assert.deepEqual(
+    taskActions.map((action) => action.payload.taskId),
+    ["anastasia-id", "dmitry-cashu"],
+  );
+  assert.equal(taskActions[0].payload.changes.project, undefined);
+  assert.equal(taskActions[1].payload.changes.project, undefined);
+});
+
+test("combined strategy and cleanup request executes grounded changes", async () => {
+  const sourceText =
+    "Проанализируй стратегию: Ольга больше не в приоритете. Сверь таблицу и TickTick и приведи всё в порядок.";
+  const planningOptions: Array<{ analysisOnly?: boolean; toolContext?: string }> = [];
+  const executionPlans: ActionPlan[] = [];
+  const result = await runAssistantPipeline(sourceText, {
+    planImplementation: async (_text, options) => {
+      planningOptions.push(options);
+      if (!options.toolContext) {
+        return {
+          kind: "ready",
+          plan: {
+            version: 1,
+            mode: "analytics",
+            sourceText,
+            continueAfterReads: true,
+            actions: [
+              { id: "tasks-1", type: "list_tasks", payload: { limit: 50 } },
+              { id: "tasks-2", type: "list_tasks", payload: { limit: 50 } },
+              {
+                id: "sheet-1",
+                type: "read_sheet",
+                payload: {
+                  target: { kind: "id", spreadsheetId: "money-sheet" },
+                  range: "'Лиды'!A1:H40",
+                },
+              },
+            ],
+          },
+        };
+      }
+
+      return {
+        kind: "ready",
+        plan: {
+          version: 1,
+          mode: "batch_report",
+          sourceText,
+          actions: [
+            {
+              id: "pause-olga",
+              type: "update_task",
+              payload: {
+                taskId: "task-olga",
+                changes: {
+                  priority: "low",
+                  contentNote: "Ольга в декрете; работа поставлена на паузу.",
+                },
+              },
+            },
+          ],
+          strategicPlan: {
+            version: 1,
+            userGoal: sourceText,
+            projectId: null,
+            targetResources: [],
+            factsFromMessage: [],
+            factsFromContext: [],
+            assumptions: [],
+            actions: [
+              {
+                id: "execute-pause-olga",
+                kind: "execute_action",
+                linkedActionId: "pause-olga",
+                actionType: "update_task",
+                reason: "Ольга больше не находится в активном приоритете.",
+                evidence: ["Пользователь сообщил, что Ольга в декрете."],
+                confidence: 0.7,
+                executionPolicy: "auto_execute",
+                expectedChange: "Понизить приоритет и сохранить причину паузы.",
+                verification: "Повторно проверить задачу.",
+              },
+            ],
+            suggestions: [],
+            summaryIntent: "Синхронизировать рабочие системы.",
+          },
+        },
+      };
+    },
+    executeImplementation: async (plan) => {
+      executionPlans.push(plan);
+      if (executionPlans.length === 1) {
+        return plan.actions.map((action): ActionResult =>
+          action.type === "list_tasks"
+            ? {
+                actionId: action.id,
+                actionType: action.type,
+                status: "succeeded",
+                message: "Прочитано 50 задач.",
+                data: {
+                  kind: "ticktick_tasks",
+                  tasks: [
+                    {
+                      id: "task-other",
+                      projectId: "work",
+                      projectName: "Работа",
+                      title: "10 касаний с тёплыми",
+                      priority: 0,
+                    },
+                    {
+                      id: "task-olga",
+                      projectId: "money",
+                      projectName: "Скрытые деньги",
+                      title: "Ольга Журавлёва — созвон",
+                      priority: 3,
+                    },
+                  ],
+                },
+              }
+            : {
+                actionId: action.id,
+                actionType: action.type,
+                status: "succeeded",
+                message: "Таблица прочитана.",
+                data: {
+                  kind: "sheet_range",
+                  spreadsheetId: "money-sheet",
+                  spreadsheetTitle: "Скрытые деньги",
+                  range: "'Лиды'!A1:H40",
+                  values: [["Имя", "Статус"], ["Ольга Журавлёва", "Пауза — декрет"]],
+                },
+              },
+        );
+      }
+
+      return plan.actions.map((action) => ({
+        actionId: action.id,
+        actionType: action.type,
+        status: "succeeded" as const,
+        message: "Задача Ольги обновлена: приоритет понижен, причина паузы сохранена.",
+      }));
+    },
+  });
+
+  assert.equal(planningOptions[1].analysisOnly, false);
+  assert.deepEqual(
+    executionPlans[0].actions.map((action) => action.type),
+    ["list_tasks", "read_sheet"],
+  );
+  assert.equal(executionPlans[1].actions[0].type, "update_task");
+  assert.doesNotMatch(result.text, /Прочитано 50 задач/u);
+  assert.match(result.text, /приоритет понижен/u);
+});
+
+test("rejects an arbitrary TickTick task and a fake deletion note", () => {
+  const outcome: AssistantPlanOutcome = {
+    kind: "ready",
+    plan: {
+      version: 1,
+      mode: "batch_report",
+      sourceText: "Подчисти TickTick согласно стратегии в таблице",
+      actions: [
+        {
+          id: "wrong-task",
+          type: "update_task",
+          payload: {
+            taskId: "first-task",
+            changes: { contentNote: "Задача устарела и удалена" },
+          },
+        },
+      ],
+    },
+  };
+  const reconciled = reconcileOperationalActions(outcome, {
+    sourceText: outcome.plan.sourceText,
+    conversation: [],
+    discoveryResults: [
+      {
+        actionId: "read-tasks",
+        actionType: "list_tasks",
+        status: "succeeded",
+        message: "Задачи прочитаны",
+        data: {
+          kind: "ticktick_tasks",
+          tasks: [
+            {
+              id: "first-task",
+              projectId: "work",
+              projectName: "Работа",
+              title: "10 касаний с тёплыми",
+              priority: 0,
+            },
+          ],
+        },
+      },
+      {
+        actionId: "read-sheet",
+        actionType: "read_sheet",
+        status: "succeeded",
+        message: "Таблица прочитана",
+        data: {
+          kind: "sheet_range",
+          spreadsheetId: "money",
+          spreadsheetTitle: "Скрытые деньги",
+          range: "'Лиды'!A1:C10",
+          values: [["Дмитрий", "Оплата"]],
+        },
+      },
+    ],
+  });
+
+  assert.equal(reconciled.kind, "clarification");
+});
+
+test("restores the previous operational request for a short continuation", () => {
+  const restored = resolveOperationalContinuation("Ты сам это можешь сделать?", [
+    {
+      role: "user",
+      text: "Сверь стратегию с TickTick и таблицами и приведи всё в порядок.",
+    },
+    { role: "assistant", text: "Вот что стоит изменить." },
+  ]);
+
+  assert.match(restored, /Сверь стратегию/u);
+  assert.match(restored, /выполни это самостоятельно/u);
+});
+
+test("strategy output is enabled only when the user asks for analysis", () => {
+  assert.equal(
+    requestsStrategicOutput("Синхронизируй TickTick с таблицами"),
+    false,
+  );
+  assert.equal(
+    requestsStrategicOutput(
+      "Синхронизируй данные, найди узкие горлышки и дай пошаговую стратегию",
+    ),
+    true,
+  );
+});
+
+test("grounds a tab name to its containing spreadsheet", () => {
+  const outcome = groundReadActionsToWorkspace(
+    {
+      kind: "ready",
+      plan: {
+        version: 1,
+        mode: "analytics",
+        sourceText: "Проанализируй дашборд",
+        actions: [
+          {
+            id: "read-dashboard",
+            type: "read_sheet",
+            payload: {
+              target: { kind: "title", title: "ДАШБОРД" },
+              range: "'ДАШБОРД'!A1:L40",
+            },
+          },
+        ],
+      },
+    },
+    {
+      availableDocuments: [],
+      inspectedDocuments: [
+        {
+          spreadsheetId: "money-sheet",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/money-sheet",
+          title: "Скрытые деньги",
+          tabs: [
+            {
+              title: "ДАШБОРД",
+              range: "'ДАШБОРД'!A1:L40",
+              values: [],
+            },
+          ],
+        },
+      ],
+    } as unknown as GoogleSheetsWorkspaceContext,
+  );
+
+  assert.equal(outcome.kind, "ready");
+  if (outcome.kind !== "ready") return;
+  const read = outcome.plan.actions[0];
+  assert.equal(read.type, "read_sheet");
+  if (read.type !== "read_sheet") return;
+  assert.deepEqual(read.payload.target, {
+    kind: "id",
+    spreadsheetId: "money-sheet",
+  });
+});
+
+test("never exposes repeated internal reads and still returns execution plus strategy", async () => {
+  const sourceText =
+    "Проверь таблицы и TickTick, синхронизируй всё, найди узкие горлышки и выдай пошаговую стратегию на неделю.";
+  const planningOptions: Array<{ analysisOnly?: boolean; toolContext?: string }> = [];
+  let executionPass = 0;
+  const result = await runAssistantPipeline(sourceText, {
+    planImplementation: async (_text, options) => {
+      planningOptions.push(options);
+      if (planningOptions.length === 1) {
+        return {
+          kind: "ready",
+          plan: {
+            version: 1,
+            mode: "analytics",
+            sourceText,
+            continueAfterReads: true,
+            actions: [
+              { id: "tasks", type: "list_tasks", payload: { limit: 50 } },
+              {
+                id: "sheet",
+                type: "read_sheet",
+                payload: {
+                  target: { kind: "id", spreadsheetId: "money-sheet" },
+                  range: "'Лиды'!A1:H40",
+                },
+              },
+            ],
+          },
+        };
+      }
+      if (planningOptions.length === 2) {
+        return {
+          kind: "ready",
+          plan: {
+            version: 1,
+            mode: "analytics",
+            sourceText,
+            actions: [
+              { id: "repeat-tasks", type: "list_tasks", payload: { limit: 50 } },
+              {
+                id: "fake-sheet",
+                type: "read_sheet",
+                payload: {
+                  target: { kind: "title", title: "Лист1" },
+                  range: "'Лист1'!A1:L40",
+                },
+              },
+            ],
+          },
+        };
+      }
+      if (planningOptions.length === 3) {
+        return {
+          kind: "ready",
+          plan: {
+            version: 1,
+            mode: "batch_report",
+            sourceText,
+            actions: [
+              {
+                id: "pause-olga",
+                type: "update_task",
+                payload: {
+                  taskId: "task-olga",
+                  changes: { priority: "low" },
+                },
+              },
+            ],
+            strategicPlan: {
+              version: 1,
+              userGoal: sourceText,
+              projectId: null,
+              targetResources: [],
+              factsFromMessage: [],
+              factsFromContext: [],
+              assumptions: [],
+              actions: [
+                {
+                  id: "execute-olga",
+                  kind: "execute_action",
+                  linkedActionId: "pause-olga",
+                  actionType: "update_task",
+                  reason: "Статус подтверждён таблицей.",
+                  evidence: ["Ольга находится на паузе."],
+                  confidence: 0.9,
+                  executionPolicy: "auto_execute",
+                  expectedChange: "Понизить приоритет.",
+                  verification: "Перечитать задачу.",
+                },
+              ],
+              suggestions: [],
+              summaryIntent: "Синхронизировать системы.",
+            },
+          },
+        };
+      }
+      assert.equal(options.analysisOnly, true);
+      return {
+        kind: "response",
+        text: "Фокус недели — Дмитрий и Анастасия. Узкое место — просроченные следующие шаги.",
+      };
+    },
+    executeImplementation: async (plan) => {
+      executionPass += 1;
+      if (executionPass === 1) {
+        return plan.actions.map((action): ActionResult =>
+          action.type === "list_tasks"
+            ? {
+                actionId: action.id,
+                actionType: action.type,
+                status: "succeeded",
+                message: "Открытые задачи TickTick\n" + "• задача\n".repeat(50),
+                data: {
+                  kind: "ticktick_tasks",
+                  tasks: [
+                    {
+                      id: "task-olga",
+                      projectId: "money",
+                      projectName: "Скрытые деньги",
+                      title: "Ольга Журавлёва — созвон",
+                      priority: 3,
+                    },
+                  ],
+                },
+              }
+            : {
+                actionId: action.id,
+                actionType: action.type,
+                status: "succeeded",
+                message: "Таблица прочитана",
+                data: {
+                  kind: "sheet_range",
+                  spreadsheetId: "money-sheet",
+                  spreadsheetTitle: "Скрытые деньги",
+                  range: "'Лиды'!A1:H40",
+                  values: [["Ольга Журавлёва", "Пауза"]],
+                },
+              },
+        );
+      }
+      return plan.actions.map((action) => ({
+        actionId: action.id,
+        actionType: action.type,
+        status: "succeeded" as const,
+        message: "Задача Ольги обновлена.",
+      }));
+    },
+  });
+
+  assert.equal(planningOptions.length, 4);
+  assert.equal(planningOptions[1].analysisOnly, false);
+  assert.equal(planningOptions[2].analysisOnly, false);
+  assert.equal(planningOptions[3].analysisOnly, true);
+  assert.doesNotMatch(result.text, /Открытые задачи TickTick/u);
+  assert.match(result.text, /Задача Ольги обновлена/u);
+  assert.match(result.text, /Фокус недели/u);
 });
 
 test("keeps evidence from every document when tool context is compacted", () => {
@@ -422,6 +1001,21 @@ function strategicAction(
     executionPolicy: "auto_execute" as const,
     expectedChange: "Обновить подтверждённый объект.",
     verification: "Повторно прочитать объект через API.",
+  };
+}
+
+function tickTickTasksResult(
+  tasks: Extract<
+    NonNullable<ActionResult["data"]>,
+    { kind: "ticktick_tasks" }
+  >["tasks"],
+): ActionResult {
+  return {
+    actionId: "read-tasks",
+    actionType: "list_tasks",
+    status: "succeeded",
+    message: "Карточки прочитаны.",
+    data: { kind: "ticktick_tasks", tasks },
   };
 }
 

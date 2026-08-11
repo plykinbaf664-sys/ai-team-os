@@ -20,8 +20,11 @@ export function evaluateActionPlanPolicy(
   plan: ActionPlan,
   projectContext?: AssistantProjectContext,
 ): ActionPlanPolicyEvaluation {
+  const taskWriteCount = plan.actions.filter(
+    (action) => action.type === "update_task" || action.type === "complete_task",
+  ).length;
   const assessments = plan.actions.map((action) =>
-    assessAction(action, plan, projectContext),
+    assessAction(action, plan, projectContext, taskWriteCount > 5),
   );
   const strategicQuestion = plan.strategicPlan?.clarification?.question;
   const clarificationQuestions = unique([
@@ -100,6 +103,7 @@ function assessAction(
   action: AssistantAction,
   plan: ActionPlan,
   projectContext?: AssistantProjectContext,
+  massTaskWrite = false,
 ): ActionConfidenceAssessment {
   const strategic = plan.strategicPlan?.actions.find(
     (candidate) =>
@@ -136,7 +140,10 @@ function assessAction(
 
   confidence = roundConfidence(confidence);
   const forcedConfirmation =
-    risk === "critical" || strategic?.executionPolicy === "confirm_first";
+    risk === "critical" ||
+    strategic?.executionPolicy === "confirm_first" ||
+    (massTaskWrite &&
+      (action.type === "update_task" || action.type === "complete_task"));
   const suggestedOnly = strategic?.executionPolicy === "suggest_first";
   const decision = forcedConfirmation
     ? "confirm"

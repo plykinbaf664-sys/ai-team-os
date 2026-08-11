@@ -17,6 +17,13 @@ export function composeStrategicResponse(
   plan: ActionPlan,
   results: ActionResult[],
   policyQuestions: string[] = [],
+  {
+    hideReadDetails = false,
+    includeStrategy = true,
+  }: {
+    hideReadDetails?: boolean;
+    includeStrategy?: boolean;
+  } = {},
 ) {
   const dailySummary = results.find(
     (result) =>
@@ -31,7 +38,11 @@ export function composeStrategicResponse(
     return dailySummary.message;
   }
   const succeeded = results.filter((result) => result.status === "succeeded");
-  const failed = results.filter((result) => result.status === "failed");
+  const failed = results.filter(
+    (result) =>
+      result.status === "failed" &&
+      !(hideReadDetails && READ_ACTIONS.has(result.actionType)),
+  );
   const needsClarification = results.filter(
     (result) => result.status === "needs_clarification",
   );
@@ -42,12 +53,20 @@ export function composeStrategicResponse(
   const numberChanges = unique(
     succeeded.flatMap((result) => extractNumberChanges(result.message)),
   );
-  const completedLines = succeeded.map((result) =>
+  const hasWriteResult = succeeded.some(
+    (result) => !READ_ACTIONS.has(result.actionType),
+  );
+  const visibleSucceeded = hideReadDetails || hasWriteResult
+    ? succeeded.filter((result) => !READ_ACTIONS.has(result.actionType))
+    : succeeded;
+  const completedLines = visibleSucceeded.map((result) =>
     formatCompletedResult(plan, result, numberChanges.length > 0),
   );
 
   if (completedLines.length) {
-    const readOnly = succeeded.every((result) => READ_ACTIONS.has(result.actionType));
+    const readOnly = visibleSucceeded.every((result) =>
+      READ_ACTIONS.has(result.actionType),
+    );
     sections.push(section(readOnly ? "Результат" : "Выполнено", completedLines));
   }
   if (numberChanges.length) {
@@ -62,7 +81,9 @@ export function composeStrategicResponse(
     );
   }
 
-  const monitoringFindings = plan.monitoringReport?.findings ?? [];
+  const monitoringFindings = includeStrategy
+    ? plan.monitoringReport?.findings ?? []
+    : [];
   if (monitoringFindings.length) {
     sections.push(
       section(
@@ -72,12 +93,12 @@ export function composeStrategicResponse(
     );
   }
 
-  const conclusion = buildConclusion(plan, results);
+  const conclusion = includeStrategy ? buildConclusion(plan, results) : "";
   if (conclusion) {
     sections.push(section("Вывод", [conclusion]));
   }
 
-  const suggestions = unique([
+  const suggestions = includeStrategy ? unique([
     ...(plan.strategicPlan?.suggestions ?? [])
       .filter(
         (suggestion) =>
@@ -87,7 +108,7 @@ export function composeStrategicResponse(
     ...monitoringFindings.map((finding) =>
       ensurePeriod(finding.recommendation),
     ),
-  ]);
+  ]) : [];
   if (suggestions.length) {
     sections.push(section("Рекомендация", suggestions));
   }

@@ -8,8 +8,20 @@ export type TelegramFormattedMessage = {
 export function formatTelegramMessage(
   sourceText: string,
 ): TelegramFormattedMessage {
+  return formatTelegramMessages(sourceText)[0] ?? { html: "", plain: "" };
+}
+
+export function formatTelegramMessages(
+  sourceText: string,
+): TelegramFormattedMessage[] {
   const normalized = normalizeText(sourceText);
-  const sourceLines = normalized.split("\n");
+  if (!normalized) return [];
+
+  return splitSourceText(normalized).map(formatSourceChunk);
+}
+
+function formatSourceChunk(sourceText: string): TelegramFormattedMessage {
+  const sourceLines = sourceText.split("\n");
   const htmlLines: string[] = [];
   const plainLines: string[] = [];
   let firstContentLine = true;
@@ -65,12 +77,107 @@ export function formatTelegramMessage(
   }
 
   return {
-    html: truncateByLines(htmlLines, TELEGRAM_TEXT_LIMIT),
-    plain: truncateText(
-      plainLines.join("\n").trim(),
-      TELEGRAM_TEXT_LIMIT,
-    ),
+    html: htmlLines.join("\n").trim(),
+    plain: plainLines.join("\n").trim(),
   };
+}
+
+function splitSourceText(sourceText: string) {
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const block of sourceText.split(/\n{2,}/u)) {
+    const candidate = current ? `${current}\n\n${block}` : block;
+    if (fitsTelegramLimit(candidate)) {
+      current = candidate;
+      continue;
+    }
+
+    if (current.trim()) chunks.push(current.trim());
+    current = "";
+
+    if (fitsTelegramLimit(block)) {
+      current = block;
+      continue;
+    }
+
+    const parts = splitOversizedBlock(block);
+    chunks.push(...parts.slice(0, -1));
+    current = parts.at(-1) ?? "";
+  }
+
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
+function splitOversizedBlock(block: string) {
+  const parts: string[] = [];
+  let current = "";
+
+  for (const line of block.split("\n")) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (fitsTelegramLimit(candidate)) {
+      current = candidate;
+      continue;
+    }
+
+    if (current.trim()) parts.push(current.trim());
+    if (fitsTelegramLimit(line)) {
+      current = line;
+      continue;
+    }
+
+    const lineParts = splitOversizedLine(line);
+    parts.push(...lineParts.slice(0, -1));
+    current = lineParts.at(-1) ?? "";
+  }
+
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function splitOversizedLine(line: string) {
+  const parts: string[] = [];
+  let remaining = line.trim();
+
+  while (remaining && !fitsTelegramLimit(remaining)) {
+    let low = 1;
+    let high = remaining.length;
+    let best = 1;
+
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if (fitsTelegramLimit(remaining.slice(0, middle))) {
+        best = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+
+    const preferredBreak = findPreferredBreak(remaining, best);
+    parts.push(remaining.slice(0, preferredBreak).trim());
+    remaining = remaining.slice(preferredBreak).trimStart();
+  }
+
+  if (remaining) parts.push(remaining);
+  return parts.filter(Boolean);
+}
+
+function findPreferredBreak(value: string, maximum: number) {
+  const minimum = Math.floor(maximum * 0.6);
+  for (let index = maximum; index >= minimum; index -= 1) {
+    if (/\s|[.!?;,:]/u.test(value[index] ?? "")) return index + 1;
+  }
+  return maximum;
+}
+
+function fitsTelegramLimit(sourceText: string) {
+  const formatted = formatSourceChunk(sourceText);
+  return (
+    formatted.html.length <= TELEGRAM_TEXT_LIMIT &&
+    formatted.plain.length <= TELEGRAM_TEXT_LIMIT
+  );
 }
 
 function normalizeText(value: string) {
@@ -108,31 +215,4 @@ function escapeHtml(value: string) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
-}
-
-function truncateByLines(lines: string[], limit: number) {
-  const result: string[] = [];
-  let length = 0;
-
-  for (const line of lines) {
-    const addition = (result.length ? 1 : 0) + line.length;
-
-    if (length + addition > limit - 2) {
-      break;
-    }
-
-    result.push(line);
-    length += addition;
-  }
-
-  const truncated = result.length < lines.length;
-  const text = result.join("\n").trim();
-
-  return truncated ? `${text}\n…` : text;
-}
-
-function truncateText(value: string, limit: number) {
-  return value.length > limit
-    ? `${value.slice(0, limit - 2).trimEnd()}\n…`
-    : value;
 }

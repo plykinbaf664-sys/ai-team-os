@@ -125,11 +125,15 @@ async function executeListTasks(
     })),
   );
   const limit = Math.min(Math.max(action.payload.limit ?? 20, 1), 50);
+  const query = action.payload.query?.trim();
   const tasks = projectData
     .flatMap(({ project, data }) =>
       data.tasks
         .filter((task) => task.status === 0)
         .map((task) => ({ project, task })),
+    )
+    .filter(({ project, task }) =>
+      query ? matchesTaskQuery(task, project, query) : true,
     )
     .sort(compareTasks)
     .slice(0, limit);
@@ -137,7 +141,9 @@ async function executeListTasks(
   if (!tasks.length) {
     return success(
       action,
-      action.payload.project
+      query
+        ? `По запросу «${query}» открытых задач в TickTick не найдено.`
+        : action.payload.project
         ? `В проекте «${action.payload.project}» открытых задач нет.`
         : "Открытых задач в TickTick не найдено.",
       { kind: "ticktick_tasks", tasks: [] },
@@ -164,12 +170,30 @@ async function executeListTasks(
       projectId: project.id,
       projectName: project.name,
       title: task.title,
-      ...(task.content ? { content: task.content.slice(0, 500) } : {}),
+      ...(task.content ? { content: task.content.slice(0, 1_500) } : {}),
       ...(task.dueDate ? { dueDate: task.dueDate } : {}),
       ...(task.timeZone ? { timeZone: task.timeZone } : {}),
       priority: task.priority,
     })),
   });
+}
+
+function matchesTaskQuery(
+  task: TickTickTask,
+  project: TickTickProject,
+  query: string,
+) {
+  const normalizedQuery = normalizeTitle(query);
+  const haystack = normalizeTitle(
+    [task.title, task.content, project.name].filter(Boolean).join(" "),
+  );
+  if (!normalizedQuery) return true;
+  if (haystack.includes(normalizedQuery)) return true;
+
+  const tokens = normalizedQuery
+    .split(" ")
+    .filter((token) => token.length >= 3);
+  return Boolean(tokens.length) && tokens.every((token) => haystack.includes(token));
 }
 
 function compareTasks(left: LocatedTask, right: LocatedTask) {
@@ -376,22 +400,42 @@ async function executeUpdateTask(
     });
   }
 
-  const nextContent = action.payload.changes.contentNote
-    ? appendTaskNote(
+  const noteAlreadyPresent = action.payload.changes.contentNote
+    ? isTaskNoteAlreadyRepresented(
+        located.task.title,
         located.task.content,
         action.payload.changes.contentNote,
       )
+    : false;
+  const nextContent = action.payload.changes.contentNote && !noteAlreadyPresent
+    ? appendTaskNote(located.task.content, action.payload.changes.contentNote)
     : located.task.content;
+
+  const nextTitle = action.payload.changes.title?.trim() || located.task.title;
+  const nextPriority =
+    action.payload.changes.priority === undefined
+      ? normalizeTickTickPriority(located.task.priority)
+      : mapPriority(action.payload.changes.priority);
+  const isNoOp =
+    destination.projectId === located.project.id &&
+    nextTitle === located.task.title &&
+    nextPriority === normalizeTickTickPriority(located.task.priority) &&
+    dueDate.kind === "none" &&
+    nextContent === located.task.content;
+
+  if (isNoOp) {
+    return success(
+      action,
+      `Карточка TickTick уже актуальна: ${located.task.title}. Ничего не дублировал.`,
+    );
+  }
 
   const updated = await adapter.updateTask({
     id: located.task.id,
     projectId: destination.projectId,
-    title: action.payload.changes.title?.trim() || located.task.title,
+    title: nextTitle,
     ...(nextContent !== undefined ? { content: nextContent } : {}),
-    priority:
-      action.payload.changes.priority === undefined
-        ? normalizeTickTickPriority(located.task.priority)
-        : mapPriority(action.payload.changes.priority),
+    priority: nextPriority,
     dueDate:
       dueDate.kind === "resolved"
         ? dueDate.dueDate
@@ -410,7 +454,11 @@ async function executeUpdateTask(
     action,
     [
       `Задача обновлена в TickTick, список «${destination.projectName}»: ${updated.title}.`,
-      action.payload.changes.contentNote ? "Заметка добавлена." : "",
+      action.payload.changes.contentNote
+        ? noteAlreadyPresent
+          ? "Факт уже был в карточке, повтор не добавлял."
+          : "Заметка добавлена."
+        : "",
     ]
       .filter(Boolean)
       .join(" "),
@@ -426,6 +474,64 @@ function appendTaskNote(current: string | undefined, note: string) {
   }
 
   return [normalizedCurrent, normalizedNote].filter(Boolean).join("\n\n");
+}
+
+function isTaskNoteAlreadyRepresented(
+  title: string,
+  current: string | undefined,
+  note: string,
+) {
+  const normalizedNote = normalizeTitle(note);
+  const normalizedCurrent = normalizeTitle([title, current].filter(Boolean).join(" "));
+  if (!normalizedNote) return true;
+  if (normalizedCurrent.includes(normalizedNote)) return true;
+
+  const noteTokens = taskFactTokens(normalizedNote);
+  if (noteTokens.length < 3) return false;
+  const currentTokens = taskFactTokens(normalizedCurrent);
+  const matched = noteTokens.filter((token) =>
+    currentTokens.some(
+      (candidate) =>
+        candidate === token ||
+        (candidate.length >= 5 &&
+          token.length >= 5 &&
+          candidate.slice(0, 5) === token.slice(0, 5)),
+    ),
+  ).length;
+
+  return matched >= 3 && matched / noteTokens.length >= 0.6;
+}
+
+function taskFactTokens(value: string) {
+  const stopWords = new Set([
+    "добавлена",
+    "добавлено",
+    "пометка",
+    "уточнено",
+    "карточка",
+    "задача",
+    "работа",
+    "может",
+    "который",
+    "которая",
+    "несколько",
+    "из-за",
+    "только",
+    "раньше",
+    "будет",
+    "сейчас",
+    "этого",
+  ]);
+  return [...new Set(
+    value
+      .split(" ")
+      .filter(
+        (token) =>
+          token.length >= 4 &&
+          !/^\d+$/u.test(token) &&
+          !stopWords.has(token),
+      ),
+  )];
 }
 
 async function executeCompleteTask(

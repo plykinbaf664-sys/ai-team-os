@@ -1,3 +1,8 @@
+import {
+  formatTelegramMessages,
+  type TelegramFormattedMessage,
+} from "./message-format";
+
 type SendTelegramMessageInput = {
   chatId: number;
   text: string;
@@ -24,7 +29,42 @@ export async function sendTelegramMessage({
   }
 
   const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const formatted = formatTelegramMessage(text);
+  const formattedMessages = formatTelegramMessages(text);
+  if (!formattedMessages.length) {
+    throw new Error("Telegram message is empty.");
+  }
+  const messageIds: number[] = [];
+
+  for (const [index, formatted] of formattedMessages.entries()) {
+    const messageId = await sendFormattedMessage({
+      endpoint,
+      chatId,
+      formatted,
+      replyToMessageId: index === 0 ? replyToMessageId : undefined,
+      fetchImplementation,
+    });
+    messageIds.push(messageId);
+  }
+
+  return {
+    messageId: messageIds.at(-1)!,
+    messageIds,
+  };
+}
+
+async function sendFormattedMessage({
+  endpoint,
+  chatId,
+  formatted,
+  replyToMessageId,
+  fetchImplementation,
+}: {
+  endpoint: string;
+  chatId: number;
+  formatted: TelegramFormattedMessage;
+  replyToMessageId?: number;
+  fetchImplementation: typeof fetch;
+}) {
   const response = await fetchImplementation(endpoint, {
     method: "POST",
     headers: {
@@ -59,9 +99,7 @@ export async function sendTelegramMessage({
         (await fallbackResponse.json()) as TelegramSendMessageResponse;
 
       if (fallbackResponse.ok && fallbackData.ok) {
-        return {
-          messageId: requireTelegramMessageId(fallbackData),
-        };
+        return requireTelegramMessageId(fallbackData);
       }
 
       throw new Error(
@@ -72,9 +110,7 @@ export async function sendTelegramMessage({
     throw new Error(data.description || "Telegram sendMessage failed.");
   }
 
-  return {
-    messageId: requireTelegramMessageId(data),
-  };
+  return requireTelegramMessageId(data);
 }
 
 function requireTelegramMessageId(data: TelegramSendMessageResponse) {
@@ -92,4 +128,3 @@ function isEntityFormattingError(description?: string) {
     description ?? "",
   );
 }
-import { formatTelegramMessage } from "./message-format";
